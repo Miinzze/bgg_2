@@ -1,0 +1,16 @@
+# Credentials - NIE committen!
+.env
+.env.local
+.env.production
+
+# Uploads
+uploads/*
+!uploads/.htaccess
+
+# Logs
+logs/*
+*.log
+
+# System
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+# Zugriff auf bestimmte Dateien verbieten
+<FilesMatch "\.(ini|log|conf)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# PHP-Einstellungen
+php_flag display_errors off
+php_flag log_errors on
+
+# Directory Listing deaktivieren
+Options -Indexes
