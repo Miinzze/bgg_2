@@ -197,9 +197,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_all_settings']))
                             <i class="fas fa-chart-bar"></i> Reports
                         </a>
                     <?php endif; ?>
-                    <?php if (hasPermission('add_patchnotes')): ?>
-                        <a href="patchnotes_admin.php" class="btn btn-secondary">
-                            <i class="fas fa-file-alt"></i> Patchnotes
+                    <?php if (hasPermission('generate_qr')): ?>
+                        <a href="qr_code_generator.php" class="btn btn-secondary">
+                            <i class="fas fa-file-alt"></i> QR-Codes Generieren
+                        </a>
+                    <?php endif; ?>
+                    <?php if (hasPermission('list_qr')): ?>
+                        <a href="qr_code_list.php" class="btn btn-secondary">
+                            <i class="fas fa-file-alt"></i> QR-Code Liste
                         </a>
                     <?php endif; ?>
                 </div>

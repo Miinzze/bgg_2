@@ -1,0 +1,226 @@
+/* GPS-Button Styles */
+.gps-button {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.3s;
+}
+
+.gps-button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.gps-button:active {
+    transform: translateY(0);
+}
+
+.gps-button.active {
+    background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+}
+
+.gps-status {
+    font-size: 13px;
+    color: #6c757d;
+    margin-top: 8px;
+}
+
+.gps-accuracy {
+    display: inline-block;
+    padding: 4px 8px;
+    background: #28a74520;
+    color: #28a745;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+/* Kamera-Styles */
+.camera-container {
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+    margin: 20px 0;
+}
+
+.camera-container video {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.camera-controls {
+    position: absolute;
+    bottom: 20px;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+    padding: 0 20px;
+}
+
+.camera-button {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: white;
+    border: 4px solid #007bff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    color: #007bff;
+    transition: all 0.2s;
+}
+
+.camera-button:hover {
+    transform: scale(1.1);
+}
+
+.camera-button.capture {
+    background: #007bff;
+    color: white;
+}
+
+#cameraCanvas {
+    display: none;
+}
+
+.captured-photos {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 20px;
+}
+
+.captured-photo {
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 2px solid #dee2e6;
+}
+
+.captured-photo img {
+    width: 100%;
+    height: 150px;
+    object-fit: cover;
+}
+
+.captured-photo .remove-photo {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    background: #dc3545;
+    color: white;
+    border: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Drag & Drop Zone */
+.drop-zone {
+    border: 3px dashed #dee2e6;
+    border-radius: 8px;
+    padding: 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.3s;
+    background: #f8f9fa;
+}
+
+.drop-zone:hover {
+    border-color: #007bff;
+    background: #e7f3ff;
+}
+
+.drop-zone.drag-over {
+    border-color: #28a745;
+    background: #d4edda;
+}
+
+.drop-zone i {
+    font-size: 48px;
+    color: #6c757d;
+    margin-bottom: 15px;
+}
+
+.drop-zone p {
+    margin: 0;
+    color: #6c757d;
+}
+
+.image-preview-item {
+    position: relative;
+    display: inline-block;
+    margin: 10px;
+}
+
+.image-preview-item img {
+    width: 150px;
+    height: 150px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 2px solid #dee2e6;
+}
+
+.remove-image {
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    background: #dc3545;
+    color: white;
+    border: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+/* Mobile Optimierungen */
+@media (max-width: 768px) {
+    .camera-container {
+        margin: 10px -15px;
+        border-radius: 0;
+    }
+    
+    .camera-controls {
+        bottom: 10px;
+        gap: 10px;
+    }
+    
+    .gps-button {
+        width: 100%;
+        justify-content: center;
+    }
+}
+
+/* Feature Detection Alerts */
+.feature-not-supported {
+    background: #fff3cd;
+    border-left: 4px solid #ffc107;
+    padding: 15px;
+    border-radius: 5px;
+    margin: 15px 0;
+}

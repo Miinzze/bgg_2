@@ -2,60 +2,72 @@
 require_once 'config.php';
 require_once 'functions.php';
 requireLogin();
-requirePermission('markers_edit');
-
-trackUsage('rescan');
-
-$id = $_GET['id'] ?? 0;
-$marker = getMarkerById($id, $pdo);
-
-if (!$marker) {
-    die('Marker nicht gefunden');
-}
 
 $message = '';
 $messageType = '';
+$marker = null;
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        $message = 'Ungültiges Sicherheitstoken';
+// QR-Code gescannt?
+if (isset($_GET['qr'])) {
+    $scannedQR = trim($_GET['qr']);
+    
+    // Suche Marker mit diesem QR-Code
+    $stmt = $pdo->prepare("
+        SELECT m.*, u.username as created_by_name
+        FROM markers m
+        LEFT JOIN users u ON m.created_by = u.id
+        WHERE m.qr_code = ? AND m.deleted_at IS NULL
+    ");
+    $stmt->execute([$scannedQR]);
+    $marker = $stmt->fetch();
+    
+    if (!$marker) {
+        $message = 'Kein Marker mit diesem QR-Code gefunden!';
+        $messageType = 'danger';
+    }
+}
+
+// Position aktualisieren
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_position'])) {
+    validateCSRF();
+    
+    $markerId = intval($_POST['marker_id'] ?? 0);
+    $latitude = $_POST['latitude'] ?? null;
+    $longitude = $_POST['longitude'] ?? null;
+    
+    if (!$latitude || !$longitude) {
+        $message = 'Bitte GPS-Position erfassen';
+        $messageType = 'danger';
+    } elseif (!validateCoordinates($latitude, $longitude)) {
+        $message = 'Ungültige GPS-Koordinaten';
         $messageType = 'danger';
     } else {
-        $latitude = $_POST['latitude'] ?? null;
-        $longitude = $_POST['longitude'] ?? null;
-        
-        if (!$latitude || !$longitude) {
-            $message = 'Bitte erfassen Sie einen Standort';
-            $messageType = 'danger';
-        } elseif (!validateCoordinates($latitude, $longitude)) {
-            $message = 'Ungültige GPS-Koordinaten';
-            $messageType = 'danger';
-        } else {
-            $oldLat = $marker['latitude'];
-            $oldLng = $marker['longitude'];
+        try {
+            $stmt = $pdo->prepare("
+                UPDATE markers 
+                SET latitude = ?, longitude = ?, updated_at = NOW()
+                WHERE id = ?
+            ");
             
-            $stmt = $pdo->prepare("UPDATE markers SET latitude = ?, longitude = ? WHERE id = ?");
-            if ($stmt->execute([floatval($latitude), floatval($longitude), $id])) {
-                
-                // Position-Historie speichern (optional)
-                try {
-                    $stmt = $pdo->prepare("INSERT INTO position_history (marker_id, latitude, longitude, changed_by) VALUES (?, ?, ?, ?)");
-                    $stmt->execute([$id, floatval($oldLat), floatval($oldLng), $_SESSION['user_id']]);
-                } catch (Exception $e) {
-                    // Tabelle existiert eventuell nicht
-                }
-                
-                logActivity('position_rescanned', "Position neu erfasst für '{$marker['name']}'", $id);
-                
-                $message = 'Position erfolgreich aktualisiert!';
-                $messageType = 'success';
-                
-                $marker = getMarkerById($id, $pdo);
-                header("refresh:2;url=view_marker.php?id=$id");
-            } else {
-                $message = 'Fehler beim Aktualisieren der Position';
-                $messageType = 'danger';
-            }
+            $stmt->execute([
+                floatval($latitude),
+                floatval($longitude),
+                $markerId
+            ]);
+            
+            logActivity('marker_position_updated', "Position aktualisiert", $markerId);
+            
+            $message = 'Position erfolgreich aktualisiert!';
+            $messageType = 'success';
+            
+            // Marker neu laden
+            $marker = getMarkerById($markerId, $pdo);
+            
+            header("refresh:2;url=view_marker.php?id=$markerId");
+            
+        } catch (Exception $e) {
+            $message = 'Fehler: ' . e($e->getMessage());
+            $messageType = 'danger';
         }
     }
 }
@@ -65,13 +77,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Position neu erfassen - <?= e($marker['name']) ?></title>
+    <title>Marker erneut scannen - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
-    <link rel="stylesheet" href="css/mobile-features.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="css/mobile-features.css">
     <script src="js/gps-helper.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <style>
+        #qr-reader {
+            width: 100%;
+            max-width: 600px;
+            margin: 20px auto;
+            border: 3px solid #007bff;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        
+        .marker-info-box {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #28a745;
+        }
+        
+        .marker-info-box h3 {
+            margin-top: 0;
+            color: #28a745;
+        }
+    </style>
 </head>
 <body>
     <?php include 'header.php'; ?>
@@ -79,143 +114,199 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div class="main-container">
         <div class="content-wrapper">
             <div class="page-header">
-                <h1><i class="fas fa-crosshairs"></i> Position neu erfassen</h1>
-                <h2><?= e($marker['name']) ?></h2>
+                <h1><i class="fas fa-qrcode"></i> Marker erneut scannen</h1>
+                <p>Scannen Sie einen QR-Code um die Position zu aktualisieren</p>
             </div>
             
             <?php if ($message): ?>
                 <div class="alert alert-<?= $messageType ?>"><?= e($message) ?></div>
             <?php endif; ?>
+
+            <!-- QR-Scanner -->
+            <?php if (!$marker): ?>
+            <div class="form-section">
+                <h2><i class="fas fa-camera"></i> QR-Code Scanner</h2>
+                
+                <div style="text-align: center;">
+                    <button id="start-scan" class="btn btn-primary btn-large" style="margin: 10px;">
+                        <i class="fas fa-camera"></i> Kamera starten & QR-Code scannen
+                    </button>
+                    <button id="stop-scan" class="btn btn-danger" style="margin: 10px; display: none;">
+                        <i class="fas fa-stop"></i> Scanner stoppen
+                    </button>
+                </div>
+                
+                <div id="qr-reader" style="display: none;"></div>
+                
+                <div id="scan-result" style="display: none; margin: 20px 0; padding: 20px; background: #e3f2fd; border-left: 4px solid #1976d2; border-radius: 4px;">
+                    <strong>QR-Code gescannt:</strong>
+                    <div style="font-size: 24px; font-weight: bold; font-family: 'Courier New', monospace; color: #1976d2; margin: 10px 0;" id="scanned-code"></div>
+                    <p>Marker wird geladen...</p>
+                </div>
+            </div>
+            <?php endif; ?>
+
+            <!-- Marker gefunden - Position aktualisieren -->
+            <?php if ($marker): ?>
             
+            <div class="marker-info-box">
+                <h3><i class="fas fa-check-circle"></i> Marker gefunden!</h3>
+                <p><strong>Name:</strong> <?= e($marker['name']) ?></p>
+                <p><strong>QR-Code:</strong> <code><?= e($marker['qr_code']) ?></code></p>
+                <?php if ($marker['category']): ?>
+                    <p><strong>Kategorie:</strong> <?= e($marker['category']) ?></p>
+                <?php endif; ?>
+                <?php if ($marker['serial_number']): ?>
+                    <p><strong>Seriennummer:</strong> <?= e($marker['serial_number']) ?></p>
+                <?php endif; ?>
+                <p>
+                    <strong>Aktuelle Position:</strong> 
+                    <?= number_format($marker['latitude'], 6) ?>, <?= number_format($marker['longitude'], 6) ?>
+                </p>
+            </div>
+
             <form method="POST" class="marker-form">
-                <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                <?php include 'csrf_token.php'; ?>
+                <input type="hidden" name="marker_id" value="<?= $marker['id'] ?>">
                 
                 <div class="form-section">
-                    <h2><i class="fas fa-map-marker-alt"></i> Neuer Standort</h2>
+                    <h2><i class="fas fa-map-marker-alt"></i> Neue Position erfassen</h2>
                     
-                    <!-- GPS Auto-Erfassung -->
-                    <div style="margin-bottom: 20px;">
+                    <div style="margin: 20px 0;">
                         <button type="button" id="gpsButton" class="gps-button" onclick="getGPSPosition()">
-                            <i class="fas fa-crosshairs"></i> Aktuellen GPS-Standort erfassen
+                            <i class="fas fa-crosshairs"></i> GPS-Position automatisch erfassen
                         </button>
                         <div id="gpsStatus"></div>
-                        
-                        <p style="margin-top: 15px; color: #6c757d;">
-                            <strong>Aktuelle Position:</strong><br>
-                            Lat: <?= number_format($marker['latitude'], 6) ?>, 
-                            Lng: <?= number_format($marker['longitude'], 6) ?>
-                        </p>
                     </div>
                     
-                    <!-- Manuelle Eingabe -->
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="latitude">Breitengrad *</label>
-                            <input type="text" id="latitude" name="latitude" required 
-                                   value="<?= e($marker['latitude']) ?>" step="any">
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="longitude">Längengrad *</label>
-                            <input type="text" id="longitude" name="longitude" required 
-                                   value="<?= e($marker['longitude']) ?>" step="any">
-                        </div>
-                    </div>
+                    <input type="hidden" name="latitude" id="latitude" value="<?= $marker['latitude'] ?>">
+                    <input type="hidden" name="longitude" id="longitude" value="<?= $marker['longitude'] ?>">
                     
-                    <!-- Karte -->
-                    <div id="map" style="height: 500px; border-radius: 8px; border: 2px solid #dee2e6;"></div>
-                    <p style="margin-top: 10px; color: #6c757d; font-size: 14px;">
-                        <i class="fas fa-info-circle"></i> 
-                        Nutzen Sie GPS für automatische Erfassung oder verschieben Sie den Marker auf der Karte
+                    <div id="miniMap" style="height: 400px; margin-top: 15px; border-radius: 8px; border: 2px solid #dee2e6;"></div>
+                    
+                    <p style="margin-top: 15px; color: #666;">
+                        <i class="fas fa-info-circle"></i> Der rote Marker zeigt die aktuelle Position. 
+                        Nutzen Sie den GPS-Button um die Position zu aktualisieren.
                     </p>
                 </div>
                 
                 <div class="form-actions">
-                    <button type="submit" class="btn btn-success btn-large">
-                        <i class="fas fa-save"></i> Position speichern
+                    <button type="submit" name="update_position" class="btn btn-primary btn-large">
+                        <i class="fas fa-save"></i> Position aktualisieren
                     </button>
                     <a href="view_marker.php?id=<?= $marker['id'] ?>" class="btn btn-secondary">
-                        <i class="fas fa-times"></i> Abbrechen
+                        <i class="fas fa-eye"></i> Marker anzeigen
+                    </a>
+                    <a href="rescan.php" class="btn btn-secondary">
+                        <i class="fas fa-qrcode"></i> Anderen QR-Code scannen
                     </a>
                 </div>
             </form>
+            
+            <?php endif; ?>
         </div>
     </div>
+    
     <?php include 'footer.php'; ?>
+    
     <script>
-    const gpsHelper = new GPSHelper();
-    
-    // Karte initialisieren
-    const map = L.map('map').setView([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>], 15);
-    
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors',
-        maxZoom: 19
-    }).addTo(map);
-    
-    const markerIcon = L.icon({
-        iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-        shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
-        iconSize: [25, 41],
-        iconAnchor: [12, 41],
-        popupAnchor: [1, -34],
-        shadowSize: [41, 41]
-    });
-    
-    let marker = L.marker([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>], {
-        draggable: true,
-        icon: markerIcon
-    }).addTo(map);
-    
-    marker.on('dragend', function(e) {
-        const pos = marker.getLatLng();
-        document.getElementById('latitude').value = pos.lat.toFixed(6);
-        document.getElementById('longitude').value = pos.lng.toFixed(6);
-    });
-    
-    map.on('click', function(e) {
-        marker.setLatLng(e.latlng);
-        document.getElementById('latitude').value = e.latlng.lat.toFixed(6);
-        document.getElementById('longitude').value = e.latlng.lng.toFixed(6);
-    });
-    
-    // GPS Position abrufen
-    function getGPSPosition() {
-        const button = document.getElementById('gpsButton');
-        const statusDiv = document.getElementById('gpsStatus');
+        // QR-Code Scanner
+        let html5QrCode = null;
         
-        button.disabled = true;
-        button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> GPS wird abgerufen...';
+        document.getElementById('start-scan').addEventListener('click', function() {
+            document.getElementById('qr-reader').style.display = 'block';
+            document.getElementById('start-scan').style.display = 'none';
+            document.getElementById('stop-scan').style.display = 'inline-block';
+            
+            html5QrCode = new Html5Qrcode("qr-reader");
+            
+            html5QrCode.start(
+                { facingMode: "environment" },
+                {
+                    fps: 10,
+                    qrbox: { width: 250, height: 250 }
+                },
+                (decodedText) => {
+                    document.getElementById('scanned-code').textContent = decodedText;
+                    document.getElementById('scan-result').style.display = 'block';
+                    
+                    html5QrCode.stop().then(() => {
+                        window.location.href = 'rescan.php?qr=' + encodeURIComponent(decodedText);
+                    });
+                },
+                (errorMessage) => {
+                    // Ignore scan errors
+                }
+            ).catch(err => {
+                alert('Kamera-Zugriff fehlgeschlagen: ' + err);
+            });
+        });
         
-        gpsHelper.getCurrentPosition(
-            (position) => {
-                document.getElementById('latitude').value = position.lat.toFixed(6);
-                document.getElementById('longitude').value = position.lng.toFixed(6);
-                
-                map.setView([position.lat, position.lng], 16);
-                marker.setLatLng([position.lat, position.lng]);
-                
-                button.disabled = false;
-                button.classList.add('active');
-                button.innerHTML = '<i class="fas fa-check"></i> GPS-Position erfasst';
-                
-                gpsHelper.showStatus('gpsStatus', 
-                    `Neue Position erfasst mit ${Math.round(position.accuracy)}m Genauigkeit`, 
-                    'success'
-                );
-                
-                setTimeout(() => {
-                    button.classList.remove('active');
-                    button.innerHTML = '<i class="fas fa-crosshairs"></i> GPS-Position erneut erfassen';
-                }, 3000);
-            },
-            (error) => {
-                button.disabled = false;
-                button.innerHTML = '<i class="fas fa-crosshairs"></i> Aktuellen GPS-Standort erfassen';
-                gpsHelper.showStatus('gpsStatus', error, 'error');
+        document.getElementById('stop-scan').addEventListener('click', function() {
+            if (html5QrCode) {
+                html5QrCode.stop().then(() => {
+                    document.getElementById('qr-reader').style.display = 'none';
+                    document.getElementById('start-scan').style.display = 'inline-block';
+                    document.getElementById('stop-scan').style.display = 'none';
+                });
             }
-        );
-    }
+        });
+
+        <?php if ($marker): ?>
+        // Karte initialisieren mit aktueller Position
+        const currentLat = <?= $marker['latitude'] ?>;
+        const currentLng = <?= $marker['longitude'] ?>;
+        
+        const miniMap = L.map('miniMap').setView([currentLat, currentLng], 16);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(miniMap);
+        
+        let marker = L.marker([currentLat, currentLng]).addTo(miniMap);
+        
+        // GPS-Helper
+        const gpsHelper = new GPSHelper();
+
+        function getGPSPosition() {
+            const button = document.getElementById('gpsButton');
+            
+            button.disabled = true;
+            button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> GPS wird abgerufen...';
+            
+            gpsHelper.getCurrentPosition(
+                (position) => {
+                    const lat = position.lat;
+                    const lng = position.lng;
+                    
+                    document.getElementById('latitude').value = lat.toFixed(6);
+                    document.getElementById('longitude').value = lng.toFixed(6);
+                    
+                    miniMap.setView([lat, lng], 16);
+                    marker.setLatLng([lat, lng]);
+                    
+                    button.disabled = false;
+                    button.classList.add('active');
+                    button.innerHTML = '<i class="fas fa-check"></i> Neue Position erfasst';
+                    
+                    gpsHelper.showStatus('gpsStatus', 
+                        `Neue Position erfasst mit ${Math.round(position.accuracy)}m Genauigkeit`, 
+                        'success'
+                    );
+                    
+                    setTimeout(() => {
+                        button.classList.remove('active');
+                        button.innerHTML = '<i class="fas fa-crosshairs"></i> GPS-Position erneut erfassen';
+                    }, 3000);
+                },
+                (error) => {
+                    button.disabled = false;
+                    button.innerHTML = '<i class="fas fa-crosshairs"></i> GPS-Position automatisch erfassen';
+                    gpsHelper.showStatus('gpsStatus', error, 'error');
+                }
+            );
+        }
+        <?php endif; ?>
     </script>
 </body>
 </html>

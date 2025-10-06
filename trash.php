@@ -2,22 +2,22 @@
 require_once 'config.php';
 require_once 'functions.php';
 requireLogin();
-requirePermission('markers_delete');
 
 $message = '';
 $messageType = '';
 
-// Marker wiederherstellen
-if (isset($_GET['restore'])) {
-    $id = intval($_GET['restore']);
+// Wiederherstellen
+if (isset($_POST['restore']) && isset($_POST['marker_id'])) {
+    validateCSRF();
+    $markerId = intval($_POST['marker_id']);
     
     try {
         $stmt = $pdo->prepare("UPDATE markers SET deleted_at = NULL, deleted_by = NULL WHERE id = ?");
-        $stmt->execute([$id]);
+        $stmt->execute([$markerId]);
         
-        logActivity('marker_restored', "Marker aus Papierkorb wiederhergestellt", $id);
+        logActivity('marker_restored', 'Marker aus Papierkorb wiederhergestellt', $markerId);
         
-        $message = 'Marker erfolgreich wiederhergestellt!';
+        $message = 'Marker erfolgreich wiederhergestellt';
         $messageType = 'success';
     } catch (Exception $e) {
         $message = 'Fehler: ' . $e->getMessage();
@@ -25,84 +25,100 @@ if (isset($_GET['restore'])) {
     }
 }
 
-// Marker endgültig löschen
-if (isset($_GET['delete_permanent'])) {
-    $id = intval($_GET['delete_permanent']);
+// Endgültig löschen
+if (isset($_POST['delete_permanent']) && isset($_POST['marker_id'])) {
+    validateCSRF();
+    $markerId = intval($_POST['marker_id']);
     
-    try {
-        $pdo->beginTransaction();
-        
-        // Alle verknüpften Daten löschen
-        $pdo->prepare("DELETE FROM marker_images WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM marker_documents WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM marker_serial_numbers WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM marker_custom_values WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM maintenance_history WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM checkout_history WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM inspection_schedules WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM marker_comments WHERE marker_id = ?")->execute([$id]);
-        $pdo->prepare("DELETE FROM checklist_completions WHERE marker_id = ?")->execute([$id]);
-        
-        // Marker löschen
-        $pdo->prepare("DELETE FROM markers WHERE id = ?")->execute([$id]);
-        
-        $pdo->commit();
-        
-        logActivity('marker_deleted_permanent', "Marker endgültig gelöscht", $id);
-        
-        $message = 'Marker endgültig gelöscht!';
-        $messageType = 'success';
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        $message = 'Fehler: ' . $e->getMessage();
+    if (!hasPermission('markers_delete')) {
+        $message = 'Keine Berechtigung zum Löschen';
         $messageType = 'danger';
+    } else {
+        try {
+            // Marker-Info vor dem Löschen holen
+            $stmt = $pdo->prepare("SELECT qr_code, name FROM markers WHERE id = ?");
+            $stmt->execute([$markerId]);
+            $marker = $stmt->fetch();
+            
+            if ($marker) {
+                $pdo->beginTransaction();
+                
+                // QR-Code im Pool freigeben
+                $stmt = $pdo->prepare("
+                    UPDATE qr_code_pool 
+                    SET is_assigned = 0, marker_id = NULL, assigned_at = NULL
+                    WHERE qr_code = ?
+                ");
+                $stmt->execute([$marker['qr_code']]);
+                
+                // Marker endgültig löschen (CASCADE löscht automatisch Bilder, Dokumente etc.)
+                $stmt = $pdo->prepare("DELETE FROM markers WHERE id = ?");
+                $stmt->execute([$markerId]);
+                
+                $pdo->commit();
+                
+                logActivity('marker_deleted_permanent', "Marker '{$marker['name']}' endgültig gelöscht", $markerId);
+                
+                $message = 'Marker endgültig gelöscht. QR-Code kann wiederverwendet werden.';
+                $messageType = 'success';
+            }
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $message = 'Fehler: ' . $e->getMessage();
+            $messageType = 'danger';
+        }
     }
 }
 
 // Papierkorb leeren
-if (isset($_GET['empty_trash'])) {
-    try {
-        $pdo->beginTransaction();
-        
-        // Alle gelöschten Marker holen
-        $stmt = $pdo->query("SELECT id FROM markers WHERE deleted_at IS NOT NULL");
-        $deletedIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
-        
-        foreach ($deletedIds as $id) {
-            // Verknüpfte Daten löschen
-            $pdo->prepare("DELETE FROM marker_images WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM marker_documents WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM marker_serial_numbers WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM marker_custom_values WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM maintenance_history WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM checkout_history WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM inspection_schedules WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM marker_comments WHERE marker_id = ?")->execute([$id]);
-            $pdo->prepare("DELETE FROM checklist_completions WHERE marker_id = ?")->execute([$id]);
-        }
-        
-        // Alle gelöschten Marker endgültig entfernen
-        $pdo->query("DELETE FROM markers WHERE deleted_at IS NOT NULL");
-        
-        $pdo->commit();
-        
-        logActivity('trash_emptied', "Papierkorb geleert (" . count($deletedIds) . " Marker)");
-        
-        $message = count($deletedIds) . ' Marker endgültig gelöscht!';
-        $messageType = 'success';
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        $message = 'Fehler: ' . $e->getMessage();
+if (isset($_POST['empty_trash'])) {
+    validateCSRF();
+    
+    if (!hasPermission('markers_delete')) {
+        $message = 'Keine Berechtigung';
         $messageType = 'danger';
+    } else {
+        try {
+            $pdo->beginTransaction();
+            
+            // Alle gelöschten Marker holen
+            $stmt = $pdo->query("SELECT id, qr_code FROM markers WHERE deleted_at IS NOT NULL");
+            $deletedMarkers = $stmt->fetchAll();
+            
+            // QR-Codes freigeben
+            foreach ($deletedMarkers as $marker) {
+                $stmt = $pdo->prepare("
+                    UPDATE qr_code_pool 
+                    SET is_assigned = 0, marker_id = NULL, assigned_at = NULL
+                    WHERE qr_code = ?
+                ");
+                $stmt->execute([$marker['qr_code']]);
+            }
+            
+            // Alle endgültig löschen
+            $stmt = $pdo->query("DELETE FROM markers WHERE deleted_at IS NOT NULL");
+            $count = $stmt->rowCount();
+            
+            $pdo->commit();
+            
+            logActivity('trash_emptied', "$count Marker endgültig gelöscht");
+            
+            $message = "$count Marker endgültig gelöscht. Alle QR-Codes können wiederverwendet werden.";
+            $messageType = 'success';
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $message = 'Fehler: ' . $e->getMessage();
+            $messageType = 'danger';
+        }
     }
 }
 
 // Gelöschte Marker laden
 $stmt = $pdo->query("
-    SELECT m.*, u.username as deleted_by_name 
-    FROM markers m 
-    LEFT JOIN users u ON m.deleted_by = u.id 
-    WHERE m.deleted_at IS NOT NULL 
+    SELECT m.*, u.username as deleted_by_name
+    FROM markers m
+    LEFT JOIN users u ON m.deleted_by = u.id
+    WHERE m.deleted_at IS NOT NULL
     ORDER BY m.deleted_at DESC
 ");
 $deletedMarkers = $stmt->fetchAll();
@@ -112,57 +128,8 @@ $deletedMarkers = $stmt->fetchAll();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Papierkorb - RFID Marker System</title>
+    <title>Papierkorb - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        .trash-item {
-            background: var(--light-gray);
-            padding: 20px;
-            border-radius: 8px;
-            margin-bottom: 15px;
-            border-left: 4px solid var(--danger-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .trash-item-info {
-            flex: 1;
-        }
-        
-        .trash-item-title {
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--secondary-color);
-            margin-bottom: 8px;
-        }
-        
-        .trash-item-meta {
-            font-size: 13px;
-            color: var(--medium-gray);
-            display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
-        }
-        
-        .trash-actions {
-            display: flex;
-            gap: 10px;
-        }
-        
-        .empty-trash {
-            text-align: center;
-            padding: 60px 20px;
-            color: var(--medium-gray);
-        }
-        
-        .empty-trash i {
-            font-size: 64px;
-            opacity: 0.2;
-            margin-bottom: 20px;
-        }
-    </style>
 </head>
 <body>
     <?php include 'header.php'; ?>
@@ -170,88 +137,89 @@ $deletedMarkers = $stmt->fetchAll();
     <div class="main-container">
         <div class="content-wrapper">
             <div class="page-header">
-                <div>
-                    <h1><i class="fas fa-trash"></i> Papierkorb</h1>
-                    <p style="color: var(--medium-gray); margin-top: 5px;">
-                        Gelöschte Marker können hier wiederhergestellt werden
-                    </p>
-                </div>
+                <h1><i class="fas fa-trash"></i> Papierkorb</h1>
                 <div class="header-actions">
-                    <?php if (!empty($deletedMarkers)): ?>
-                        <a href="?empty_trash=1" class="btn btn-danger"
-                           onclick="return confirm('Papierkorb wirklich leeren? Alle Marker werden ENDGÜLTIG gelöscht!')">
-                            <i class="fas fa-trash-alt"></i> Papierkorb leeren
-                        </a>
+                    <?php if (!empty($deletedMarkers) && hasPermission('markers_delete')): ?>
+                        <form method="POST" style="display: inline;" onsubmit="return confirm('Papierkorb wirklich leeren? Alle Marker werden endgültig gelöscht!')">
+                            <?php include 'csrf_token.php'; ?>
+                            <button type="submit" name="empty_trash" class="btn btn-danger">
+                                <i class="fas fa-trash-alt"></i> Papierkorb leeren
+                            </button>
+                        </form>
                     <?php endif; ?>
-                    <a href="index.php" class="btn btn-secondary">
-                        <i class="fas fa-arrow-left"></i> Zurück
+                    
+                    <a href="markers.php" class="btn btn-secondary">
+                        <i class="fas fa-arrow-left"></i> Zurück zur Übersicht
                     </a>
                 </div>
             </div>
             
             <?php if ($message): ?>
-                <div class="alert alert-<?= $messageType ?>"><?= e($message) ?></div>
+                <div class="alert alert-<?= $messageType ?>"><?= $message ?></div>
             <?php endif; ?>
             
             <?php if (empty($deletedMarkers)): ?>
-                <div class="empty-trash">
-                    <i class="fas fa-trash"></i>
-                    <h2>Papierkorb ist leer</h2>
-                    <p>Keine gelöschten Marker vorhanden</p>
+                <div style="text-align: center; padding: 60px 20px; color: #999;">
+                    <i class="fas fa-trash" style="font-size: 64px; margin-bottom: 20px; opacity: 0.3;"></i>
+                    <h3>Papierkorb ist leer</h3>
+                    <p>Es befinden sich keine gelöschten Marker im Papierkorb</p>
                 </div>
             <?php else: ?>
-                <div class="info-box" style="margin-bottom: 20px;">
-                    <p>
-                        <i class="fas fa-info-circle"></i> 
-                        <strong><?= count($deletedMarkers) ?></strong> gelöschte Marker im Papierkorb.
-                        Diese können wiederhergestellt oder endgültig gelöscht werden.
-                    </p>
+                <div class="info-box" style="background: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107; margin-bottom: 20px;">
+                    <strong><i class="fas fa-info-circle"></i> Hinweis:</strong>
+                    Gelöschte Marker können wiederhergestellt werden. Bei endgültigem Löschen wird der QR-Code freigegeben und kann wiederverwendet werden.
                 </div>
                 
-                <?php foreach ($deletedMarkers as $marker): ?>
-                    <div class="trash-item">
-                        <div class="trash-item-info">
-                            <div class="trash-item-title">
-                                <?= e($marker['name']) ?>
-                                <?php if ($marker['is_storage']): ?>
-                                    <span class="badge badge-info">Lager</span>
-                                <?php elseif ($marker['is_multi_device']): ?>
-                                    <span class="badge badge-info">Mehrgerät</span>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>QR-Code</th>
+                            <th>Kategorie</th>
+                            <th>Gelöscht am</th>
+                            <th>Gelöscht von</th>
+                            <th>Aktionen</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($deletedMarkers as $marker): ?>
+                        <tr>
+                            <td><?= e($marker['name']) ?></td>
+                            <td><code><?= e($marker['qr_code']) ?></code></td>
+                            <td><?= e($marker['category'] ?? '-') ?></td>
+                            <td><?= formatDateTime($marker['deleted_at']) ?></td>
+                            <td><?= e($marker['deleted_by_name'] ?? '-') ?></td>
+                            <td>
+                                <form method="POST" style="display: inline;">
+                                    <?php include 'csrf_token.php'; ?>
+                                    <input type="hidden" name="marker_id" value="<?= $marker['id'] ?>">
+                                    <button type="submit" name="restore" class="btn btn-sm btn-success" title="Wiederherstellen">
+                                        <i class="fas fa-undo"></i> Wiederherstellen
+                                    </button>
+                                </form>
+                                
+                                <?php if (hasPermission('markers_delete')): ?>
+                                <form method="POST" style="display: inline;" onsubmit="return confirm('Marker wirklich endgültig löschen? Dies kann nicht rückgängig gemacht werden!')">
+                                    <?php include 'csrf_token.php'; ?>
+                                    <input type="hidden" name="marker_id" value="<?= $marker['id'] ?>">
+                                    <button type="submit" name="delete_permanent" class="btn btn-sm btn-danger" title="Endgültig löschen">
+                                        <i class="fas fa-times"></i> Endgültig löschen
+                                    </button>
+                                </form>
                                 <?php endif; ?>
-                            </div>
-                            <div class="trash-item-meta">
-                                <span><i class="fas fa-tag"></i> <?= e($marker['category']) ?></span>
-                                <span><i class="fas fa-microchip"></i> <?= e($marker['rfid_chip']) ?></span>
-                                <?php if ($marker['serial_number']): ?>
-                                    <span><i class="fas fa-barcode"></i> <?= e($marker['serial_number']) ?></span>
-                                <?php endif; ?>
-                                <span>
-                                    <i class="fas fa-trash-alt"></i> 
-                                    Gelöscht: <?= date('d.m.Y H:i', strtotime($marker['deleted_at'])) ?> Uhr
-                                </span>
-                                <?php if ($marker['deleted_by_name']): ?>
-                                    <span><i class="fas fa-user"></i> <?= e($marker['deleted_by_name']) ?></span>
-                                <?php endif; ?>
-                            </div>
-                        </div>
-                        
-                        <div class="trash-actions">
-                            <a href="?restore=<?= $marker['id'] ?>" 
-                               class="btn btn-success"
-                               onclick="return confirm('Marker wiederherstellen?')">
-                                <i class="fas fa-undo"></i> Wiederherstellen
-                            </a>
-                            <a href="?delete_permanent=<?= $marker['id'] ?>" 
-                               class="btn btn-danger"
-                               onclick="return confirm('Marker ENDGÜLTIG löschen? Diese Aktion kann nicht rückgängig gemacht werden!')">
-                                <i class="fas fa-times"></i> Endgültig löschen
-                            </a>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+                
+                <div style="margin-top: 20px; color: #666; font-size: 14px;">
+                    <i class="fas fa-recycle"></i> <?= count($deletedMarkers) ?> Marker im Papierkorb
+                </div>
             <?php endif; ?>
         </div>
     </div>
+    
     <?php include 'footer.php'; ?>
 </body>
 </html>

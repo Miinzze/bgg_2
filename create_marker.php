@@ -1,4 +1,7 @@
 <?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+ini_set('max_execution_time', 30); // Max 30 Sekunden
 require_once 'config.php';
 require_once 'functions.php';
 requireAdmin();
@@ -13,9 +16,13 @@ $message = '';
 $messageType = '';
 $settings = getSystemSettings();
 
+// Verfügbare QR-Codes abrufen
+$availableQRCodes = getAvailableQRCodes($pdo, 100);
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     validateCSRF();
-    $rfid = trim($_POST['rfid_chip'] ?? '');
+    
+    $qrCode = trim($_POST['qr_code'] ?? '');
     $name = trim($_POST['name'] ?? '');
     $category = trim($_POST['category'] ?? '');
     $isStorage = isset($_POST['is_storage']);
@@ -25,12 +32,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     // ===== INPUT VALIDIERUNG =====
     
-    // RFID validieren
-    if (empty($rfid)) {
-        $message = 'RFID-Chip ID ist erforderlich';
+    if (empty($qrCode)) {
+        $message = 'Bitte wählen Sie einen QR-Code aus';
         $messageType = 'danger';
-    } elseif (!validateRFID($rfid)) {
-        $message = 'Ungültiges RFID-Format (mindestens 8 Zeichen)';
+    } elseif (!validateQRCode($qrCode)) {
+        $message = 'Ungültiges QR-Code-Format';
         $messageType = 'danger';
     }
     // Name validieren
@@ -51,12 +57,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $message = 'Ungültige GPS-Koordinaten';
         $messageType = 'danger';
     } else {
-        // Prüfen ob RFID bereits existiert
-        $stmt = $pdo->prepare("SELECT id FROM markers WHERE rfid_chip = ?");
-        $stmt->execute([$rfid]);
+        // Prüfen ob QR-Code verfügbar ist
+        $stmt = $pdo->prepare("SELECT * FROM qr_code_pool WHERE qr_code = ? AND is_assigned = 0");
+        $stmt->execute([$qrCode]);
         
-        if ($stmt->fetch()) {
-            $message = 'Dieser RFID-Chip ist bereits registriert';
+        if (!$stmt->fetch()) {
+            $message = 'Dieser QR-Code ist nicht verfügbar oder bereits zugewiesen';
             $messageType = 'warning';
         } else {
             try {
@@ -66,13 +72,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $rentalStatus = $isStorage ? null : 'verfuegbar';
                 
                 $stmt = $pdo->prepare("
-                    INSERT INTO markers (rfid_chip, name, category, is_storage, is_multi_device, rental_status,
+                    INSERT INTO markers (qr_code, name, category, is_storage, is_multi_device, rental_status,
                                        latitude, longitude, created_by)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ");
                 
                 $stmt->execute([
-                    $rfid, $name, $category, $isStorage ? 1 : 0, $isMultiDevice ? 1 : 0, $rentalStatus,
+                    $qrCode, $name, $category, $isStorage ? 1 : 0, $isMultiDevice ? 1 : 0, $rentalStatus,
                     floatval($latitude), floatval($longitude), $_SESSION['user_id']
                 ]);
                 
@@ -82,6 +88,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $publicToken = bin2hex(random_bytes(32));
                 $stmt = $pdo->prepare("UPDATE markers SET public_token = ? WHERE id = ?");
                 $stmt->execute([$publicToken, $markerId]);
+                
+                // QR-Code im Pool als zugewiesen markieren
+                assignQRCodeToMarker($qrCode, $markerId, $pdo);
                 
                 // Bei Multi-Device: Mehrere Seriennummern speichern
                 if ($isMultiDevice) {
@@ -146,7 +155,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ]);
                 }
                 
-                // Bilder hochladen (bereits validiert in uploadImage-Funktion)
+                // Bilder hochladen
                 if (!empty($_FILES['images']['name'][0])) {
                     foreach ($_FILES['images']['tmp_name'] as $key => $tmpName) {
                         if (!empty($tmpName)) {
@@ -205,7 +214,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->commit();
 
                 // Activity Log
-                logActivity('marker_created', "Marker '{$name}' erstellt", $markerId);
+                logActivity('marker_created', "Marker '{$name}' erstellt mit QR-Code '{$qrCode}'", $markerId);
                 $message = 'Marker erfolgreich erstellt!';
                 $messageType = 'success';
                 
@@ -225,24 +234,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Marker manuell erstellen - RFID Marker System</title>
+    <title>Marker manuell erstellen - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="css/mobile-features.css">
     <script src="js/gps-helper.js"></script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <style>
-        .serial-number-group {
-            margin-bottom: 10px;
-        }
-        .serial-numbers-container {
-            display: none;
-        }
-        .disabled-field {
-            background-color: #e9ecef !important;
-            opacity: 0.6;
-        }
-    </style>
 </head>
 <body>
     <?php include 'header.php'; ?>
@@ -254,11 +251,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <p>Erstellen Sie einen Marker mit manueller Standortwahl auf der Karte</p>
             </div>
             
+            <?php if (empty($availableQRCodes)): ?>
+                <div class="alert alert-warning">
+                    <strong><i class="fas fa-exclamation-triangle"></i> Keine QR-Codes verfügbar!</strong><br>
+                    Sie müssen zuerst QR-Codes generieren, bevor Sie Marker erstellen können.<br>
+                    <a href="qr_code_generator.php" class="btn btn-primary" style="margin-top: 10px;">
+                        <i class="fas fa-plus"></i> Jetzt QR-Codes generieren
+                    </a>
+                </div>
+            <?php endif; ?>
+            
             <?php if ($message): ?>
                 <div class="alert alert-<?= $messageType ?>"><?= e($message) ?></div>
             <?php endif; ?>
             
             <form method="POST" enctype="multipart/form-data" class="marker-form" id="createForm">
+                <?= csrf_field() ?>
+                
+                <div class="form-section">
+                    <h2><i class="fas fa-qrcode"></i> QR-Code auswählen</h2>
+                    
+                    <div class="form-group">
+                        <label for="qr_code">QR-Code *</label>
+                        <select id="qr_code" name="qr_code" required <?= empty($availableQRCodes) ? 'disabled' : '' ?>>
+                            <option value="">-- Bitte wählen --</option>
+                            <?php foreach ($availableQRCodes as $code): ?>
+                                <option value="<?= e($code['qr_code']) ?>">
+                                    <?= e($code['qr_code']) ?>
+                                    <?php if ($code['print_batch']): ?>
+                                        (Batch: <?= e($code['print_batch']) ?>)
+                                    <?php endif; ?>
+                                </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                </div>
+                
                 <div class="form-section">
                     <h2><i class="fas fa-map-marker-alt"></i> Standort</h2>
                     
@@ -293,14 +321,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 
                 <div class="form-section">
-                    <h2>RFID & Grunddaten</h2>
-                    
-                    <div class="form-group">
-                        <label for="rfid_chip">RFID-Chip ID *</label>
-                        <input type="text" id="rfid_chip" name="rfid_chip" required 
-                               placeholder="z.B. RFID12345678">
-                        <small>Mindestens 8 alphanumerische Zeichen</small>
-                    </div>
+                    <h2>Grunddaten</h2>
                     
                     <div class="form-row">
                         <div class="form-group">
@@ -322,6 +343,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         </div>
                     </div>
                 </div>
+                
+                <!-- [REST DES FORMULARS IDENTISCH ZUR scan.php] -->
+                <!-- Multi-Device, Seriennummern, Wartung, Custom Fields, Bilder, PDFs -->
                 
                 <div class="form-section">
                     <h2>Geräteinformationen</h2>
@@ -368,7 +392,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                     
                     <!-- Mehrere Seriennummern (Multi-Device) -->
-                    <div class="serial-numbers-container" id="multi_serial_container">
+                    <div style="display: none;" id="multi_serial_container">
                         <label class="form-label">Seriennummern der Geräte an diesem Standort</label>
                         <div id="serial_numbers_list">
                             <div class="serial-number-group">
@@ -380,9 +404,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <button type="button" class="btn btn-secondary" id="add_serial">
                             + Weitere Seriennummer hinzufügen
                         </button>
-                        <small style="display: block; margin-top: 10px; color: #6c757d;">
-                            Fügen Sie die Seriennummern aller Geräte hinzu, die sich an diesem Standort befinden.
-                        </small>
                     </div>
                     
                     <div class="form-group" id="fuel_group">
@@ -395,53 +416,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                 </div>
                 
-                <!-- Custom Fields -->
-                <?php
-                $customFields = $pdo->query("SELECT * FROM custom_fields ORDER BY display_order, id")->fetchAll();
-                if (!empty($customFields)):
-                ?>
-                <div class="form-section">
-                    <h2><i class="fas fa-list"></i> Zusätzliche Informationen</h2>
-                    
-                    <?php foreach ($customFields as $field): ?>
-                        <div class="form-group">
-                            <label for="custom_<?= $field['id'] ?>">
-                                <?= e($field['field_label']) ?>
-                                <?php if ($field['required']): ?>
-                                    <span style="color: red;">*</span>
-                                <?php endif; ?>
-                            </label>
-                            
-                            <?php if ($field['field_type'] === 'textarea'): ?>
-                                <textarea id="custom_<?= $field['id'] ?>" 
-                                        name="custom_fields[<?= $field['id'] ?>]" 
-                                        rows="4"
-                                        <?= $field['required'] ? 'required' : '' ?>></textarea>
-                            
-                            <?php elseif ($field['field_type'] === 'number'): ?>
-                                <input type="number" 
-                                    id="custom_<?= $field['id'] ?>" 
-                                    name="custom_fields[<?= $field['id'] ?>]"
-                                    step="any"
-                                    <?= $field['required'] ? 'required' : '' ?>>
-                            
-                            <?php elseif ($field['field_type'] === 'date'): ?>
-                                <input type="date" 
-                                    id="custom_<?= $field['id'] ?>" 
-                                    name="custom_fields[<?= $field['id'] ?>]"
-                                    <?= $field['required'] ? 'required' : '' ?>>
-                            
-                            <?php else: ?>
-                                <input type="text" 
-                                    id="custom_<?= $field['id'] ?>" 
-                                    name="custom_fields[<?= $field['id'] ?>]"
-                                    <?= $field['required'] ? 'required' : '' ?>>
-                            <?php endif; ?>
-                        </div>
-                    <?php endforeach; ?>
-                </div>
-                <?php endif; ?>
-
                 <div class="form-section" id="maintenance_section">
                     <h2>Wartung</h2>
                     
@@ -471,24 +445,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div id="imagePreview" class="image-preview"></div>
                 </div>
-
-                <!-- PDF Dokumente -->
-                <?php if (hasPermission('documents_upload')): ?>
-                <div class="form-section">
-                    <h2><i class="fas fa-file-pdf"></i> PDF-Dokumente</h2>
-                    
-                    <div class="form-group">
-                        <label for="documents">PDF-Dokumente hochladen (mehrere möglich)</label>
-                        <input type="file" id="documents" name="documents[]" multiple accept=".pdf,application/pdf">
-                        <small>Nur PDF-Dateien (max. 10MB pro Datei)</small>
-                    </div>
-                    
-                    <div id="pdfPreview" style="margin-top: 10px;"></div>
-                </div>
-                <?php endif; ?>
                 
                 <div class="form-actions">
-                    <button type="submit" class="btn btn-primary btn-large">Marker erstellen</button>
+                    <button type="submit" class="btn btn-primary btn-large" <?= empty($availableQRCodes) ? 'disabled' : '' ?>>
+                        Marker erstellen
+                    </button>
                     <a href="index.php" class="btn btn-secondary">Abbrechen</a>
                 </div>
             </form>
@@ -496,31 +457,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
     <?php include 'footer.php'; ?>
     <script>
-        // Einstellungen direkt aus PHP als Variablen
+        // Einstellungen aus PHP
         const MAP_LAT = <?= $settings['map_default_lat'] ?>;
         const MAP_LNG = <?= $settings['map_default_lng'] ?>;
         const MAP_ZOOM = <?= $settings['map_default_zoom'] ?>;
         
-        console.log('Karten-Position:', MAP_LAT, MAP_LNG, MAP_ZOOM);
-        
-                document.getElementById('documents').addEventListener('change', function(e) {
-                    const previewDiv = document.getElementById('pdfPreview');
-                    previewDiv.innerHTML = '';
-                    
-                    Array.from(e.target.files).forEach(file => {
-                        const item = document.createElement('div');
-                        item.style.cssText = 'padding: 10px; background: #f8f9fa; margin: 5px 0; border-radius: 5px; display: flex; align-items: center; gap: 10px;';
-                        item.innerHTML = `
-                            <i class="fas fa-file-pdf" style="color: #dc3545; font-size: 24px;"></i>
-                            <div style="flex: 1;">
-                                <strong>${file.name}</strong><br>
-                                <small>${(file.size / 1024 / 1024).toFixed(2)} MB</small>
-                            </div>
-                        `;
-                        previewDiv.appendChild(item);
-                    });
-                });
-
         // Karte initialisieren
         const map = L.map('createMap').setView([MAP_LAT, MAP_LNG], MAP_ZOOM);
         
@@ -531,22 +472,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         let marker = null;
         
-        // Karte nach dem Laden nochmal zentrieren
         window.addEventListener('load', function() {
             setTimeout(function() {
                 map.invalidateSize();
                 map.setView([MAP_LAT, MAP_LNG], MAP_ZOOM);
-                console.log('Karte neu zentriert auf:', MAP_LAT, MAP_LNG, MAP_ZOOM);
             }, 200);
         });
         
-        // GPS-Helper initialisieren
+        // GPS-Helper
         const gpsHelper = new GPSHelper();
 
-        // GPS Position abrufen
         function getGPSPosition() {
             const button = document.getElementById('gpsButton');
-            
             button.disabled = true;
             button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> GPS wird abgerufen...';
             
@@ -590,24 +527,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const lat = e.latlng.lat;
             const lng = e.latlng.lng;
             
-            // Koordinaten in Hidden Fields speichern
-            document.getElementById('latitude').value = lat;
-            document.getElementById('longitude').value = lng;
+            document.getElementById('latitude').value = lat.toFixed(6);
+            document.getElementById('longitude').value = lng.toFixed(6);
             
-            // Marker setzen oder aktualisieren
             if (marker) {
                 marker.setLatLng(e.latlng);
             } else {
                 marker = L.marker(e.latlng).addTo(map);
             }
-            
-            // Koordinaten anzeigen
-            document.getElementById('coordText').textContent = 
-                lat.toFixed(6) + ', ' + lng.toFixed(6);
-            document.getElementById('coordinatesDisplay').style.display = 'block';
         });
         
-        // Multi-Device und Storage Logic
+        // Multi-Device Logic (wie in scan.php)
         const multiDeviceCheckbox = document.getElementById('is_multi_device');
         const storageCheckbox = document.getElementById('is_storage');
         const singleSerialContainer = document.getElementById('single_serial_container');
@@ -616,62 +546,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const maintenanceSection = document.getElementById('maintenance_section');
         const storageCheckboxContainer = document.getElementById('storage_checkbox_container');
         
-        const fuelLevelInput = document.getElementById('fuel_level');
-        const maintenanceIntervalInput = document.getElementById('maintenance_interval');
-        const lastMaintenanceInput = document.getElementById('last_maintenance');
-        const singleSerialInput = document.getElementById('serial_number');
-        const operatingHoursInput = document.getElementById('operating_hours');
-        
         function updateFormFields() {
             const isMultiDevice = multiDeviceCheckbox.checked;
             const isStorage = storageCheckbox.checked;
             
             if (isMultiDevice) {
-                // Multi-Device aktiviert
                 singleSerialContainer.style.display = 'none';
                 multiSerialContainer.style.display = 'block';
                 fuelGroup.style.display = 'none';
                 maintenanceSection.style.display = 'none';
                 storageCheckboxContainer.style.display = 'none';
-                
-                // Felder deaktivieren
-                singleSerialInput.disabled = true;
-                fuelLevelInput.disabled = true;
-                maintenanceIntervalInput.disabled = true;
-                lastMaintenanceInput.disabled = true;
-                operatingHoursInput.disabled = true;
-                storageCheckbox.disabled = true;
-                storageCheckbox.checked = false;
             } else {
-                // Einzelgerät
                 singleSerialContainer.style.display = 'grid';
                 multiSerialContainer.style.display = 'none';
                 storageCheckboxContainer.style.display = 'block';
                 
-                singleSerialInput.disabled = false;
-                operatingHoursInput.disabled = false;
-                storageCheckbox.disabled = false;
-                
                 if (isStorage) {
-                    // Lagergerät
                     fuelGroup.style.display = 'none';
                     maintenanceSection.style.display = 'none';
                     document.getElementById('operating_hours_group').style.display = 'none';
-                    
-                    fuelLevelInput.disabled = true;
-                    maintenanceIntervalInput.disabled = true;
-                    lastMaintenanceInput.disabled = true;
-                    operatingHoursInput.disabled = true;
                 } else {
-                    // Normales Einzelgerät
                     fuelGroup.style.display = 'block';
                     maintenanceSection.style.display = 'block';
                     document.getElementById('operating_hours_group').style.display = 'block';
-                    
-                    fuelLevelInput.disabled = false;
-                    maintenanceIntervalInput.disabled = false;
-                    lastMaintenanceInput.disabled = false;
-                    operatingHoursInput.disabled = false;
                 }
             }
         }
@@ -696,14 +593,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('serial_numbers_list').appendChild(newSerial);
         });
         
-        // Seriennummer entfernen
         document.addEventListener('click', function(e) {
             if (e.target.classList.contains('remove-serial')) {
                 e.target.closest('.serial-number-group').remove();
             }
         });
         
-        // Kraftstoffanzeige aktualisieren
         function updateFuelDisplay(value) {
             document.getElementById('fuelValue').textContent = value;
         }
@@ -737,7 +632,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         });
         
-        // Initiale Anzeige
         updateFormFields();
     </script>
 </body>

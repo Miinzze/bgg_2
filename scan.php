@@ -5,10 +5,37 @@ requireLogin();
 
 $message = '';
 $messageType = '';
+$qrCodeInfo = null;
 
+// QR-Code gescannt?
+if (isset($_GET['qr'])) {
+    $scannedQR = trim($_GET['qr']);
+    
+    // QR-Code in Pool suchen
+    $stmt = $pdo->prepare("
+        SELECT qcp.*, m.id as marker_id, m.name as marker_name
+        FROM qr_code_pool qcp
+        LEFT JOIN markers m ON qcp.marker_id = m.id AND m.deleted_at IS NULL
+        WHERE qcp.qr_code = ?
+    ");
+    $stmt->execute([$scannedQR]);
+    $qrCodeInfo = $stmt->fetch();
+    
+    if (!$qrCodeInfo) {
+        $message = 'QR-Code nicht gefunden! Bitte erstellen Sie den QR-Code zuerst im System.';
+        $messageType = 'danger';
+    } elseif ($qrCodeInfo['is_assigned']) {
+        // QR-Code bereits zugewiesen -> Marker anzeigen
+        header('Location: view_marker.php?id=' . $qrCodeInfo['marker_id']);
+        exit;
+    }
+}
+
+// Formular zum Aktivieren des QR-Codes
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     validateCSRF();
-    $rfid = trim($_POST['rfid_chip'] ?? '');
+    
+    $qrCode = trim($_POST['qr_code'] ?? '');
     $name = trim($_POST['name'] ?? '');
     $category = trim($_POST['category'] ?? '');
     $isStorage = isset($_POST['is_storage']);
@@ -18,12 +45,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     // ===== INPUT VALIDIERUNG =====
     
-    // RFID validieren
-    if (empty($rfid)) {
-        $message = 'RFID-Chip ID ist erforderlich';
-        $messageType = 'danger';
-    } elseif (!validateRFID($rfid)) {
-        $message = 'Ungültiges RFID-Format (mindestens 8 Zeichen)';
+    if (empty($qrCode)) {
+        $message = 'QR-Code ist erforderlich';
         $messageType = 'danger';
     }
     // Name validieren
@@ -38,18 +61,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     // Koordinaten validieren
     elseif (!$latitude || !$longitude) {
-        $message = 'Bitte Standort auf Karte wählen';
+        $message = 'Bitte Standort auf Karte wählen oder GPS nutzen';
         $messageType = 'danger';
     } elseif (!validateCoordinates($latitude, $longitude)) {
         $message = 'Ungültige GPS-Koordinaten';
         $messageType = 'danger';
     } else {
-        // Prüfen ob RFID bereits existiert
-        $stmt = $pdo->prepare("SELECT id FROM markers WHERE rfid_chip = ?");
-        $stmt->execute([$rfid]);
+        // Prüfen ob QR-Code existiert und verfügbar ist
+        $stmt = $pdo->prepare("SELECT * FROM qr_code_pool WHERE qr_code = ?");
+        $stmt->execute([$qrCode]);
+        $poolCode = $stmt->fetch();
         
-        if ($stmt->fetch()) {
-            $message = 'Dieser RFID-Chip ist bereits registriert';
+        if (!$poolCode) {
+            $message = 'Dieser QR-Code existiert nicht im System';
+            $messageType = 'danger';
+        } elseif ($poolCode['is_assigned']) {
+            $message = 'Dieser QR-Code ist bereits einem Marker zugewiesen';
             $messageType = 'warning';
         } else {
             try {
@@ -59,13 +86,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $rentalStatus = $isStorage ? null : 'verfuegbar';
                 
                 $stmt = $pdo->prepare("
-                    INSERT INTO markers (rfid_chip, name, category, is_storage, is_multi_device, rental_status,
+                    INSERT INTO markers (qr_code, name, category, is_storage, is_multi_device, rental_status,
                                        latitude, longitude, created_by)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ");
                 
                 $stmt->execute([
-                    $rfid, $name, $category, $isStorage ? 1 : 0, $isMultiDevice ? 1 : 0, $rentalStatus,
+                    $qrCode, $name, $category, $isStorage ? 1 : 0, $isMultiDevice ? 1 : 0, $rentalStatus,
                     floatval($latitude), floatval($longitude), $_SESSION['user_id']
                 ]);
                 
@@ -75,6 +102,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $publicToken = bin2hex(random_bytes(32));
                 $stmt = $pdo->prepare("UPDATE markers SET public_token = ? WHERE id = ?");
                 $stmt->execute([$publicToken, $markerId]);
+                
+                // QR-Code im Pool als zugewiesen markieren
+                $stmt = $pdo->prepare("
+                    UPDATE qr_code_pool 
+                    SET is_assigned = 1, marker_id = ?, assigned_at = NOW()
+                    WHERE qr_code = ?
+                ");
+                $stmt->execute([$markerId, $qrCode]);
                 
                 // Bei Multi-Device: Mehrere Seriennummern speichern
                 if ($isMultiDevice) {
@@ -139,7 +174,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ]);
                 }
                 
-                // Bilder hochladen (bereits validiert in uploadImage-Funktion)
+                // Bilder hochladen
                 if (!empty($_FILES['images']['name'][0])) {
                     foreach ($_FILES['images']['tmp_name'] as $key => $tmpName) {
                         if (!empty($tmpName)) {
@@ -198,8 +233,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->commit();
 
                 // Activity Log
-                logActivity('marker_created', "Marker '{$name}' erstellt", $markerId);
-                $message = 'Marker erfolgreich erstellt!';
+                logActivity('marker_created', "Marker '{$name}' erstellt mit QR-Code '{$qrCode}'", $markerId);
+                $message = "✓ Marker erfolgreich erstellt! QR-Code '{$qrCode}' wurde aktiviert.";
                 $messageType = 'success';
                 
                 header("refresh:2;url=view_marker.php?id=$markerId");
@@ -218,22 +253,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RFID Scannen - RFID Marker System</title>
+    <title>QR-Code Scannen - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="css/mobile-features.css">
     <script src="js/gps-helper.js"></script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <style>
-        .serial-number-group {
-            margin-bottom: 10px;
+        #qr-reader {
+            width: 100%;
+            max-width: 600px;
+            margin: 20px auto;
+            border: 3px solid #007bff;
+            border-radius: 10px;
+            overflow: hidden;
         }
-        .serial-numbers-container {
-            display: none;
+        
+        #qr-reader video {
+            width: 100%;
+            border-radius: 8px;
         }
-        .disabled-field {
-            background-color: #e9ecef !important;
-            opacity: 0.6;
+        
+        .scan-result {
+            margin: 20px 0;
+            padding: 20px;
+            background: #e3f2fd;
+            border-left: 4px solid #1976d2;
+            border-radius: 4px;
+        }
+        
+        .qr-code-display {
+            font-size: 24px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+            color: #1976d2;
+            margin: 10px 0;
         }
     </style>
 </head>
@@ -243,32 +298,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div class="main-container">
         <div class="content-wrapper">
             <div class="page-header">
-                <h1>RFID-Chip scannen</h1>
-                <p>Scannen Sie den RFID-Chip und erfassen Sie die Gerätedaten</p>
+                <h1><i class="fas fa-qrcode"></i> QR-Code scannen</h1>
+                <p>Scannen Sie einen QR-Code um einen Marker zu aktivieren oder anzuzeigen</p>
             </div>
             
             <?php if ($message): ?>
                 <div class="alert alert-<?= $messageType ?>"><?= e($message) ?></div>
             <?php endif; ?>
 
-            <?php if (isset($_GET['mobile_blocked'])): ?>
-                <div class="alert alert-info">
-                    <i class="fas fa-info-circle"></i> 
-                    <strong>Mobiler Modus:</strong> Das manuelle Erstellen von Markern ist nur auf Desktop-Geräten verfügbar. 
-                    Bitte nutzen Sie die RFID-Scan-Funktion oder das erneute Scannen.
+            <!-- QR-Scanner -->
+            <div class="form-section">
+                <h2><i class="fas fa-camera"></i> QR-Code Scanner</h2>
+                
+                <div style="text-align: center;">
+                    <button id="start-scan" class="btn btn-primary btn-large" style="margin: 10px;">
+                        <i class="fas fa-camera"></i> Kamera starten & Scannen
+                    </button>
+                    <button id="stop-scan" class="btn btn-danger" style="margin: 10px; display: none;">
+                        <i class="fas fa-stop"></i> Scanner stoppen
+                    </button>
                 </div>
-            <?php endif; ?>
+                
+                <div id="qr-reader" style="display: none;"></div>
+                
+                <div id="scan-result" style="display: none;" class="scan-result">
+                    <strong>QR-Code gescannt:</strong>
+                    <div class="qr-code-display" id="scanned-code"></div>
+                    <p>Formular wird vorbereitet...</p>
+                </div>
+            </div>
+
+            <!-- Formular nur anzeigen wenn QR-Code gescannt wurde -->
+            <?php if ($qrCodeInfo && !$qrCodeInfo['is_assigned']): ?>
+            
+            <div class="alert alert-info">
+                <strong><i class="fas fa-info-circle"></i> QR-Code gefunden!</strong><br>
+                Sie haben den QR-Code <strong><?= e($qrCodeInfo['qr_code']) ?></strong> gescannt.<br>
+                Dieser Code ist noch nicht zugewiesen. Bitte füllen Sie die Geräteinformationen aus:
+            </div>
 
             <form method="POST" enctype="multipart/form-data" class="marker-form" id="scanForm">
+                <?php include 'csrf_token.php'; ?>
+                <input type="hidden" name="qr_code" value="<?= e($qrCodeInfo['qr_code']) ?>">
+                
                 <div class="form-section">
-                    <h2>RFID & Standort</h2>
-                    
-                    <div class="form-group">
-                        <label for="rfid_chip">RFID-Chip ID *</label>
-                        <input type="text" id="rfid_chip" name="rfid_chip" required 
-                            placeholder="Chip scannen oder ID eingeben">
-                        <small>Format: mindestens 8 alphanumerische Zeichen</small>
-                    </div>
+                    <h2>Standort</h2>
                     
                     <!-- GPS Auto-Erfassung -->
                     <div style="margin: 20px 0;">
@@ -339,7 +413,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </div>
                     
                     <!-- Mehrere Seriennummern (Multi-Device) -->
-                    <div class="serial-numbers-container" id="multi_serial_container">
+                    <div style="display: none;" id="multi_serial_container">
                         <label class="form-label">Seriennummern</label>
                         <div id="serial_numbers_list">
                             <div class="serial-number-group">
@@ -485,44 +559,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 
                 <div class="form-actions">
-                    <button type="submit" class="btn btn-primary btn-large">Marker erstellen</button>
+                    <button type="submit" class="btn btn-primary btn-large">Marker aktivieren</button>
                     <a href="index.php" class="btn btn-secondary">Abbrechen</a>
                 </div>
             </form>
+            
+            <?php endif; ?>
         </div>
     </div>
     <?php include 'footer.php'; ?>
+    
     <script>
+        // QR-Code Scanner initialisieren
+        let html5QrCode = null;
+        
+        document.getElementById('start-scan').addEventListener('click', function() {
+            document.getElementById('qr-reader').style.display = 'block';
+            document.getElementById('start-scan').style.display = 'none';
+            document.getElementById('stop-scan').style.display = 'inline-block';
+            
+            html5QrCode = new Html5Qrcode("qr-reader");
+            
+            html5QrCode.start(
+                { facingMode: "environment" },
+                {
+                    fps: 10,
+                    qrbox: { width: 250, height: 250 }
+                },
+                (decodedText) => {
+                    // QR-Code erfolgreich gescannt
+                    document.getElementById('scanned-code').textContent = decodedText;
+                    document.getElementById('scan-result').style.display = 'block';
+                    
+                    // Scanner stoppen
+                    html5QrCode.stop().then(() => {
+                        // Zur Seite mit QR-Parameter weiterleiten
+                        window.location.href = 'scan.php?qr=' + encodeURIComponent(decodedText);
+                    });
+                },
+                (errorMessage) => {
+                    // Fehler beim Scannen (normal während des Suchens)
+                }
+            ).catch(err => {
+                alert('Kamera-Zugriff fehlgeschlagen: ' + err);
+            });
+        });
+        
+        document.getElementById('stop-scan').addEventListener('click', function() {
+            if (html5QrCode) {
+                html5QrCode.stop().then(() => {
+                    document.getElementById('qr-reader').style.display = 'none';
+                    document.getElementById('start-scan').style.display = 'inline-block';
+                    document.getElementById('stop-scan').style.display = 'none';
+                });
+            }
+        });
+
+        // Restlicher Code identisch zur alten scan.php
+        // GPS, Multi-Device, Kamera für Fotos, etc.
+        
         let miniMap = null;
         let marker = null;
         
-                document.getElementById('documents').addEventListener('change', function(e) {
-                    const previewDiv = document.getElementById('pdfPreview');
-                    previewDiv.innerHTML = '';
-                    
-                    Array.from(e.target.files).forEach(file => {
-                        const item = document.createElement('div');
-                        item.style.cssText = 'padding: 10px; background: #f8f9fa; margin: 5px 0; border-radius: 5px; display: flex; align-items: center; gap: 10px;';
-                        item.innerHTML = `
-                            <i class="fas fa-file-pdf" style="color: #dc3545; font-size: 24px;"></i>
-                            <div style="flex: 1;">
-                                <strong>${file.name}</strong><br>
-                                <small>${(file.size / 1024 / 1024).toFixed(2)} MB</small>
-                            </div>
-                        `;
-                        previewDiv.appendChild(item);
-                    });
-                });
-
-        // GPS-Helper initialisieren
         const gpsHelper = new GPSHelper();
-        let miniMap = null;
-        let marker = null;
 
-        // GPS Position abrufen
         function getGPSPosition() {
             const button = document.getElementById('gpsButton');
-            
             button.disabled = true;
             button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> GPS wird abgerufen...';
             
@@ -534,7 +636,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     document.getElementById('latitude').value = lat.toFixed(6);
                     document.getElementById('longitude').value = lng.toFixed(6);
                     
-                    // Mini-Karte anzeigen
                     const mapDiv = document.getElementById('miniMap');
                     mapDiv.style.display = 'block';
                     
@@ -571,7 +672,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             );
         }
         
-        // Multi-Device und Storage Logic
+        // Multi-Device Logic (identisch zur alten Version)
         const multiDeviceCheckbox = document.getElementById('is_multi_device');
         const storageCheckbox = document.getElementById('is_storage');
         const singleSerialContainer = document.getElementById('single_serial_container');
@@ -592,7 +693,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const isStorage = storageCheckbox.checked;
             
             if (isMultiDevice) {
-                // Multi-Device aktiviert
                 singleSerialContainer.style.display = 'none';
                 multiSerialContainer.style.display = 'block';
                 fuelGroup.style.display = 'none';
@@ -600,7 +700,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 operatingHoursGroup.style.display = 'none';
                 storageCheckboxContainer.style.display = 'none';
                 
-                // Felder deaktivieren
                 singleSerialInput.disabled = true;
                 fuelLevelInput.disabled = true;
                 maintenanceIntervalInput.disabled = true;
@@ -609,7 +708,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 storageCheckbox.disabled = true;
                 storageCheckbox.checked = false;
             } else {
-                // Einzelgerät
                 singleSerialContainer.style.display = 'block';
                 multiSerialContainer.style.display = 'none';
                 storageCheckboxContainer.style.display = 'block';
@@ -618,7 +716,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 storageCheckbox.disabled = false;
                 
                 if (isStorage) {
-                    // Lagergerät
                     fuelGroup.style.display = 'none';
                     maintenanceSection.style.display = 'none';
                     operatingHoursGroup.style.display = 'none';
@@ -628,7 +725,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     lastMaintenanceInput.disabled = true;
                     operatingHoursInput.disabled = true;
                 } else {
-                    // Normales Einzelgerät
                     fuelGroup.style.display = 'block';
                     maintenanceSection.style.display = 'block';
                     operatingHoursGroup.style.display = 'block';
@@ -644,7 +740,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         multiDeviceCheckbox.addEventListener('change', updateFormFields);
         storageCheckbox.addEventListener('change', updateFormFields);
         
-        // Weitere Seriennummer hinzufügen
         let serialCount = 1;
         document.getElementById('add_serial').addEventListener('click', function() {
             serialCount++;
@@ -661,26 +756,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('serial_numbers_list').appendChild(newSerial);
         });
         
-        // Seriennummer entfernen
         document.addEventListener('click', function(e) {
             if (e.target.classList.contains('remove-serial')) {
                 e.target.closest('.serial-number-group').remove();
             }
         });
         
-        // Kraftstoffanzeige aktualisieren
         function updateFuelDisplay(value) {
             document.getElementById('fuelValue').textContent = value;
         }
         
-        // ===== KAMERA-FUNKTIONALITÄT =====
+        // Kamera-Funktionalität für Fotos
         let cameraStream = null;
 
         document.getElementById('openCamera').addEventListener('click', async function() {
             try {
                 const constraints = {
                     video: {
-                        facingMode: 'environment', // Rückkamera bevorzugen
+                        facingMode: 'environment',
                         width: { ideal: 1920 },
                         height: { ideal: 1080 }
                     }
@@ -691,7 +784,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 document.getElementById('cameraContainer').style.display = 'block';
                 this.style.display = 'none';
             } catch (error) {
-                alert('Kamera-Zugriff fehlgeschlagen: ' + error.message + '\n\nStellen Sie sicher, dass Sie den Kamera-Zugriff erlaubt haben.');
+                alert('Kamera-Zugriff fehlgeschlagen: ' + error.message);
             }
         });
 
@@ -717,20 +810,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 const file = new File([blob], 'camera_photo_' + Date.now() + '.jpg', { type: 'image/jpeg' });
                 const dataTransfer = new DataTransfer();
                 
-                // Bestehende Dateien beibehalten
                 const existingFiles = document.getElementById('images').files;
                 for (let i = 0; i < existingFiles.length; i++) {
                     dataTransfer.items.add(existingFiles[i]);
                 }
                 
-                // Neues Foto hinzufügen
                 dataTransfer.items.add(file);
                 document.getElementById('images').files = dataTransfer.files;
                 
-                // Preview aktualisieren
                 updateImagePreview();
-                
-                alert('✓ Foto aufgenommen und zur Upload-Liste hinzugefügt!');
+                alert('✓ Foto aufgenommen!');
             }, 'image/jpeg', 0.85);
         });
 
@@ -754,63 +843,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             });
         }
 
-        // Event Listener für normalen Upload
         document.getElementById('images').addEventListener('change', updateImagePreview);
 
-        // Kamera schließen beim Verlassen der Seite
         window.addEventListener('beforeunload', function() {
             if (cameraStream) {
                 cameraStream.getTracks().forEach(track => track.stop());
             }
         });
-    
-        // Bildvorschau
-        document.getElementById('images').addEventListener('change', function(e) {
-            const previewDiv = document.getElementById('imagePreview');
+        
+        // PDF Preview
+        document.getElementById('documents').addEventListener('change', function(e) {
+            const previewDiv = document.getElementById('pdfPreview');
             previewDiv.innerHTML = '';
             
             Array.from(e.target.files).forEach(file => {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const img = document.createElement('img');
-                    img.src = e.target.result;
-                    img.style.maxWidth = '150px';
-                    img.style.margin = '10px';
-                    previewDiv.appendChild(img);
-                };
-                reader.readAsDataURL(file);
+                const item = document.createElement('div');
+                item.style.cssText = 'padding: 10px; background: #f8f9fa; margin: 5px 0; border-radius: 5px; display: flex; align-items: center; gap: 10px;';
+                item.innerHTML = `
+                    <i class="fas fa-file-pdf" style="color: #dc3545; font-size: 24px;"></i>
+                    <div style="flex: 1;">
+                        <strong>${file.name}</strong><br>
+                        <small>${(file.size / 1024 / 1024).toFixed(2)} MB</small>
+                    </div>
+                `;
+                previewDiv.appendChild(item);
             });
         });
         
-        // Initiale Anzeige
         updateFormFields();
-        
-        // NFC-Unterstützung prüfen (experimentell)
-        if ('NDEFReader' in window) {
-            const rfidInput = document.getElementById('rfid_chip');
-            const scanBtn = document.createElement('button');
-            scanBtn.type = 'button';
-            scanBtn.className = 'btn btn-secondary btn-sm';
-            scanBtn.textContent = 'NFC Scannen';
-            scanBtn.style.marginLeft = '10px';
-            
-            rfidInput.parentElement.appendChild(scanBtn);
-            
-            scanBtn.addEventListener('click', async function() {
-                try {
-                    const ndef = new NDEFReader();
-                    await ndef.scan();
-                    scanBtn.textContent = 'Bereit zum Scannen...';
-                    
-                    ndef.addEventListener('reading', ({ serialNumber }) => {
-                        rfidInput.value = serialNumber;
-                        scanBtn.textContent = 'NFC Scannen';
-                    });
-                } catch (error) {
-                    alert('NFC-Scan fehlgeschlagen: ' + error);
-                }
-            });
-        }
     </script>
 </body>
 </html>

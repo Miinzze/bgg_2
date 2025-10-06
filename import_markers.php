@@ -1,190 +1,231 @@
 <?php
 require_once 'config.php';
 require_once 'functions.php';
-requireLogin();
-requirePermission('markers_create');
+requireAdmin();
 
 $message = '';
 $messageType = '';
-$preview = null;
+$importResults = [];
 
-// Import durchführen
-if (isset($_POST['import_confirm'])) {
-    $importData = json_decode($_POST['import_data'], true);
-    $overwriteExisting = isset($_POST['overwrite_existing']);
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['import_file'])) {
+    validateCSRF();
     
-    if (!$importData || !isset($importData['markers'])) {
-        $message = 'Ungültige Import-Daten';
+    $file = $_FILES['import_file'];
+    
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $message = 'Upload-Fehler';
+        $messageType = 'danger';
+    } elseif ($file['type'] !== 'application/json' && !str_ends_with($file['name'], '.json')) {
+        $message = 'Nur JSON-Dateien erlaubt';
         $messageType = 'danger';
     } else {
-        $imported = 0;
-        $skipped = 0;
-        $updated = 0;
-        $errors = [];
-        
         try {
+            $jsonContent = file_get_contents($file['tmp_name']);
+            $importData = json_decode($jsonContent, true);
+            
+            if (!$importData || !isset($importData['markers'])) {
+                throw new Exception('Ungültige JSON-Struktur');
+            }
+            
+            $imported = 0;
+            $skipped = 0;
+            $errors = [];
+            
             $pdo->beginTransaction();
             
             foreach ($importData['markers'] as $markerData) {
-                // Prüfen ob Marker bereits existiert (anhand RFID)
-                $stmt = $pdo->prepare("SELECT id FROM markers WHERE rfid_chip = ?");
-                $stmt->execute([$markerData['rfid_chip']]);
-                $existingId = $stmt->fetchColumn();
-                
-                if ($existingId && !$overwriteExisting) {
-                    $skipped++;
-                    continue;
-                }
-                
-                // Marker-Daten vorbereiten
-                $markerFields = [
-                    'rfid_chip', 'name', 'category', 'serial_number', 'latitude', 'longitude',
-                    'operating_hours', 'fuel_level', 'is_storage', 'is_multi_device',
-                    'rental_status', 'last_maintenance', 'next_maintenance', 'maintenance_interval_months'
-                ];
-                
-                if ($existingId) {
-                    // UPDATE
-                    $sets = [];
-                    $params = [];
-                    foreach ($markerFields as $field) {
-                        if (isset($markerData[$field])) {
-                            $sets[] = "$field = ?";
-                            $params[] = $markerData[$field];
-                        }
-                    }
-                    $params[] = $existingId;
+                try {
+                    // QR-Code aus Import-Daten
+                    $qrCode = $markerData['qr_code'] ?? $markerData['rfid_chip'] ?? null; // Fallback für alte Exporte
                     
-                    $sql = "UPDATE markers SET " . implode(', ', $sets) . ", updated_at = NOW() WHERE id = ?";
-                    $stmt = $pdo->prepare($sql);
-                    $stmt->execute($params);
-                    
-                    $newMarkerId = $existingId;
-                    $updated++;
-                } else {
-                    // INSERT
-                    $fields = [];
-                    $placeholders = [];
-                    $params = [];
-                    
-                    foreach ($markerFields as $field) {
-                        if (isset($markerData[$field])) {
-                            $fields[] = $field;
-                            $placeholders[] = '?';
-                            $params[] = $markerData[$field];
-                        }
+                    if (!$qrCode) {
+                        $errors[] = "Marker '{$markerData['name']}': Kein QR-Code vorhanden";
+                        $skipped++;
+                        continue;
                     }
                     
-                    $fields[] = 'created_by';
-                    $placeholders[] = '?';
-                    $params[] = $_SESSION['user_id'];
+                    // ===== WICHTIG: QR-Code-Prüfung =====
                     
-                    $sql = "INSERT INTO markers (" . implode(', ', $fields) . ") VALUES (" . implode(', ', $placeholders) . ")";
-                    $stmt = $pdo->prepare($sql);
-                    $stmt->execute($params);
+                    // 1. Prüfen ob Marker mit diesem QR-Code bereits existiert
+                    $stmt = $pdo->prepare("SELECT id FROM markers WHERE qr_code = ? AND deleted_at IS NULL");
+                    $stmt->execute([$qrCode]);
                     
-                    $newMarkerId = $pdo->lastInsertId();
-                    $imported++;
-                }
-                
-                // Seriennummern (bei Multi-Device)
-                if (!empty($markerData['serial_numbers'])) {
-                    // Alte löschen
-                    $stmt = $pdo->prepare("DELETE FROM marker_serial_numbers WHERE marker_id = ?");
-                    $stmt->execute([$newMarkerId]);
-                    
-                    // Neue einfügen
-                    foreach ($markerData['serial_numbers'] as $sn) {
-                        $stmt = $pdo->prepare("INSERT INTO marker_serial_numbers (marker_id, serial_number) VALUES (?, ?)");
-                        $stmt->execute([$newMarkerId, $sn]);
+                    if ($stmt->fetch()) {
+                        $errors[] = "Marker mit QR-Code '{$qrCode}' existiert bereits";
+                        $skipped++;
+                        continue;
                     }
-                }
-                
-                // Custom Fields
-                if (!empty($markerData['custom_fields'])) {
-                    foreach ($markerData['custom_fields'] as $label => $value) {
-                        // Field-ID finden oder erstellen
-                        $stmt = $pdo->prepare("SELECT id FROM custom_fields WHERE field_label = ?");
-                        $stmt->execute([$label]);
-                        $fieldId = $stmt->fetchColumn();
-                        
-                        if (!$fieldId) {
-                            $stmt = $pdo->prepare("INSERT INTO custom_fields (field_label, field_type) VALUES (?, 'text')");
-                            $stmt->execute([$label]);
-                            $fieldId = $pdo->lastInsertId();
-                        }
-                        
-                        // Wert speichern
+                    
+                    // 2. Prüfen ob QR-Code im Pool existiert
+                    $stmt = $pdo->prepare("SELECT id, is_assigned FROM qr_code_pool WHERE qr_code = ?");
+                    $stmt->execute([$qrCode]);
+                    $poolCode = $stmt->fetch();
+                    
+                    if (!$poolCode) {
+                        // QR-Code existiert nicht im Pool → Erstellen
                         $stmt = $pdo->prepare("
-                            INSERT INTO marker_custom_values (marker_id, field_id, field_value)
-                            VALUES (?, ?, ?)
-                            ON DUPLICATE KEY UPDATE field_value = VALUES(field_value)
+                            INSERT INTO qr_code_pool (qr_code, print_batch) 
+                            VALUES (?, 'IMPORT')
                         ");
-                        $stmt->execute([$newMarkerId, $fieldId, $value]);
+                        $stmt->execute([$qrCode]);
+                    } elseif ($poolCode['is_assigned']) {
+                        // QR-Code bereits zugewiesen
+                        $errors[] = "QR-Code '{$qrCode}' ist bereits einem anderen Marker zugewiesen";
+                        $skipped++;
+                        continue;
                     }
-                }
-                
-                // Bilder
-                if (!empty($markerData['images_base64'])) {
-                    foreach ($markerData['images_base64'] as $imageData) {
-                        $imageContent = base64_decode($imageData['data']);
-                        $filename = 'imported_' . uniqid() . '_' . $newMarkerId . '.jpg';
-                        $filepath = UPLOAD_DIR . $filename;
-                        
-                        if (file_put_contents($filepath, $imageContent)) {
-                            $stmt = $pdo->prepare("
-                                INSERT INTO marker_images (marker_id, image_path, uploaded_by)
-                                VALUES (?, ?, ?)
-                            ");
-                            $stmt->execute([$newMarkerId, $filepath, $_SESSION['user_id']]);
+                    
+                    // Marker erstellen
+                    $stmt = $pdo->prepare("
+                        INSERT INTO markers (
+                            qr_code, name, category, serial_number, is_storage, is_multi_device,
+                            rental_status, operating_hours, fuel_level, maintenance_interval_months,
+                            last_maintenance, next_maintenance, latitude, longitude, created_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    
+                    $stmt->execute([
+                        $qrCode,
+                        $markerData['name'],
+                        $markerData['category'] ?? null,
+                        $markerData['serial_number'] ?? null,
+                        $markerData['is_storage'] ?? 0,
+                        $markerData['is_multi_device'] ?? 0,
+                        $markerData['rental_status'] ?? 'verfuegbar',
+                        $markerData['operating_hours'] ?? 0,
+                        $markerData['fuel_level'] ?? 0,
+                        $markerData['maintenance_interval_months'] ?? 6,
+                        $markerData['last_maintenance'] ?? null,
+                        $markerData['next_maintenance'] ?? null,
+                        $markerData['latitude'],
+                        $markerData['longitude'],
+                        $_SESSION['user_id']
+                    ]);
+                    
+                    $markerId = $pdo->lastInsertId();
+                    
+                    // QR-Code im Pool als zugewiesen markieren
+                    $stmt = $pdo->prepare("
+                        UPDATE qr_code_pool 
+                        SET is_assigned = 1, marker_id = ?, assigned_at = NOW()
+                        WHERE qr_code = ?
+                    ");
+                    $stmt->execute([$markerId, $qrCode]);
+                    
+                    // Public Token generieren
+                    $publicToken = bin2hex(random_bytes(32));
+                    $stmt = $pdo->prepare("UPDATE markers SET public_token = ? WHERE id = ?");
+                    $stmt->execute([$publicToken, $markerId]);
+                    
+                    // Multi-Device Seriennummern
+                    if (!empty($markerData['serial_numbers'])) {
+                        foreach ($markerData['serial_numbers'] as $sn) {
+                            if (!empty($sn)) {
+                                $stmt = $pdo->prepare("INSERT INTO marker_serial_numbers (marker_id, serial_number) VALUES (?, ?)");
+                                $stmt->execute([$markerId, $sn]);
+                            }
                         }
                     }
-                }
-                
-                // Dokumente
-                if (!empty($markerData['documents_base64'])) {
-                    $docDir = UPLOAD_DIR . 'documents/';
-                    if (!is_dir($docDir)) mkdir($docDir, 0755, true);
                     
-                    foreach ($markerData['documents_base64'] as $docData) {
-                        $docContent = base64_decode($docData['data']);
-                        $filename = 'imported_' . uniqid() . '.pdf';
-                        $filepath = $docDir . $filename;
+                    // Custom Fields
+                    if (!empty($markerData['custom_fields'])) {
+                        // Zuerst Custom Field IDs aus Labels ermitteln
+                        foreach ($markerData['custom_fields'] as $label => $value) {
+                            $stmt = $pdo->prepare("SELECT id FROM custom_fields WHERE field_label = ?");
+                            $stmt->execute([$label]);
+                            $field = $stmt->fetch();
+                            
+                            if ($field && !empty($value)) {
+                                $stmt = $pdo->prepare("INSERT INTO marker_custom_values (marker_id, field_id, field_value) VALUES (?, ?, ?)");
+                                $stmt->execute([$markerId, $field['id'], $value]);
+                            }
+                        }
+                    }
+                    
+                    // Bilder
+                    if (!empty($markerData['images_base64'])) {
+                        foreach ($markerData['images_base64'] as $imageData) {
+                            $imageContent = base64_decode($imageData['data']);
+                            $filename = uniqid('img_import_', true) . '_' . $markerId . '.' . pathinfo($imageData['filename'], PATHINFO_EXTENSION);
+                            $filepath = UPLOAD_DIR . $filename;
+                            
+                            file_put_contents($filepath, $imageContent);
+                            
+                            $stmt = $pdo->prepare("INSERT INTO marker_images (marker_id, image_path) VALUES (?, ?)");
+                            $stmt->execute([$markerId, $filepath]);
+                        }
+                    }
+                    
+                    // Dokumente
+                    if (!empty($markerData['documents_base64'])) {
+                        $docDir = UPLOAD_DIR . 'documents/';
+                        if (!is_dir($docDir)) {
+                            mkdir($docDir, 0755, true);
+                        }
                         
-                        if (file_put_contents($filepath, $docContent)) {
+                        foreach ($markerData['documents_base64'] as $docData) {
+                            $docContent = base64_decode($docData['data']);
+                            $filename = 'doc_import_' . uniqid() . '_' . $markerId . '.pdf';
+                            $filepath = $docDir . $filename;
+                            
+                            file_put_contents($filepath, $docContent);
+                            
+                            $isPublic = $docData['is_public'] ?? 0;
+                            $publicDesc = $docData['public_description'] ?? null;
+                            
                             $stmt = $pdo->prepare("
-                                INSERT INTO marker_documents (marker_id, document_name, document_path, file_size, uploaded_by)
-                                VALUES (?, ?, ?, ?, ?)
+                                INSERT INTO marker_documents 
+                                (marker_id, document_name, document_path, file_size, uploaded_by, is_public, public_description)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
                             ");
                             $stmt->execute([
-                                $newMarkerId,
+                                $markerId,
                                 $docData['filename'],
                                 $filepath,
                                 strlen($docContent),
-                                $_SESSION['user_id']
+                                $_SESSION['user_id'],
+                                $isPublic,
+                                $publicDesc
                             ]);
                         }
                     }
+                    
+                    $imported++;
+                    $importResults[] = [
+                        'name' => $markerData['name'],
+                        'qr_code' => $qrCode,
+                        'status' => 'success'
+                    ];
+                    
+                } catch (Exception $e) {
+                    $errors[] = "Marker '{$markerData['name']}': " . $e->getMessage();
+                    $skipped++;
+                    $importResults[] = [
+                        'name' => $markerData['name'],
+                        'qr_code' => $qrCode ?? 'N/A',
+                        'status' => 'error',
+                        'error' => $e->getMessage()
+                    ];
                 }
             }
             
-            // Log
-            $stmt = $pdo->prepare("
-                INSERT INTO export_import_log (action_type, user_id, filename, marker_count, status)
-                VALUES ('import', ?, ?, ?, 'success')
-            ");
-            $stmt->execute([
-                $_SESSION['user_id'],
-                $_FILES['import_file']['name'] ?? 'unknown.json',
-                $imported + $updated
-            ]);
-            
             $pdo->commit();
             
-            logActivity('markers_imported', "Import: $imported neu, $updated aktualisiert, $skipped übersprungen");
+            logActivity('markers_imported', "$imported Marker importiert, $skipped übersprungen");
             
-            $message = "Import erfolgreich! $imported neue Marker, $updated aktualisiert, $skipped übersprungen.";
-            $messageType = 'success';
+            $message = "Import abgeschlossen: $imported Marker erfolgreich importiert, $skipped übersprungen";
+            $messageType = $imported > 0 ? 'success' : 'warning';
+            
+            if (!empty($errors)) {
+                $message .= '<br><br><strong>Fehler:</strong><ul style="margin: 10px 0 0 20px;">';
+                foreach (array_slice($errors, 0, 10) as $error) {
+                    $message .= '<li>' . e($error) . '</li>';
+                }
+                if (count($errors) > 10) {
+                    $message .= '<li>... und ' . (count($errors) - 10) . ' weitere Fehler</li>';
+                }
+                $message .= '</ul>';
+            }
             
         } catch (Exception $e) {
             $pdo->rollBack();
@@ -193,28 +234,14 @@ if (isset($_POST['import_confirm'])) {
         }
     }
 }
-
-// Datei hochladen und Vorschau
-if (isset($_FILES['import_file']) && $_FILES['import_file']['error'] === UPLOAD_ERR_OK) {
-    $jsonContent = file_get_contents($_FILES['import_file']['tmp_name']);
-    $importData = json_decode($jsonContent, true);
-    
-    if (!$importData || !isset($importData['markers'])) {
-        $message = 'Ungültige JSON-Datei';
-        $messageType = 'danger';
-    } else {
-        $preview = $importData;
-    }
-}
 ?>
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Marker importieren - RFID System</title>
+    <title>Marker importieren - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 </head>
 <body>
     <?php include 'header.php'; ?>
@@ -234,141 +261,102 @@ if (isset($_FILES['import_file']) && $_FILES['import_file']['error'] === UPLOAD_
                 <div class="alert alert-<?= $messageType ?>"><?= $message ?></div>
             <?php endif; ?>
             
-            <?php if (!$preview): ?>
-                <!-- Upload-Formular -->
-                <div class="info-card" style="max-width: 800px; margin: 0 auto;">
-                    <h2><i class="fas fa-upload"></i> JSON-Datei hochladen</h2>
+            <?php if (!empty($importResults)): ?>
+            <div class="section">
+                <h2>Import-Ergebnisse</h2>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>QR-Code</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($importResults as $result): ?>
+                        <tr>
+                            <td><?= e($result['name']) ?></td>
+                            <td><code><?= e($result['qr_code']) ?></code></td>
+                            <td>
+                                <?php if ($result['status'] === 'success'): ?>
+                                    <span class="badge badge-success">✓ Importiert</span>
+                                <?php else: ?>
+                                    <span class="badge badge-danger">✗ Fehler</span>
+                                    <?php if (isset($result['error'])): ?>
+                                        <br><small><?= e($result['error']) ?></small>
+                                    <?php endif; ?>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <?php endif; ?>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                <div class="info-card">
+                    <h2><i class="fas fa-upload"></i> Import-Datei</h2>
                     
                     <form method="POST" enctype="multipart/form-data">
-                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                        <?php include 'csrf_token.php'; ?>
                         
                         <div class="form-group">
                             <label for="import_file">JSON-Datei auswählen</label>
-                            <input type="file" id="import_file" name="import_file" accept=".json" required>
-                            <small>Nur JSON-Dateien vom Export-System</small>
+                            <input type="file" id="import_file" name="import_file" accept=".json,application/json" required>
+                            <small>Nur JSON-Dateien vom Export-Tool</small>
                         </div>
                         
                         <button type="submit" class="btn btn-primary btn-block">
-                            <i class="fas fa-eye"></i> Datei analysieren
+                            <i class="fas fa-upload"></i> Import starten
                         </button>
                     </form>
-                    
-                    <div style="background: #e7f3ff; padding: 15px; border-radius: 5px; border-left: 4px solid #007bff; margin-top: 20px;">
-                        <strong><i class="fas fa-info-circle"></i> Hinweis:</strong>
-                        <p style="margin: 5px 0 0 0; font-size: 14px;">
-                            Laden Sie nur JSON-Dateien hoch, die mit dem Export-System erstellt wurden.
-                        </p>
-                    </div>
                 </div>
-            <?php else: ?>
-                <!-- Vorschau und Bestätigung -->
+                
                 <div class="info-card">
-                    <h2><i class="fas fa-check-circle"></i> Import-Vorschau</h2>
+                    <h2><i class="fas fa-info-circle"></i> Import-Informationen</h2>
                     
-                    <div style="background: #d4edda; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745; margin-bottom: 20px;">
-                        <strong>Datei erfolgreich analysiert!</strong>
-                        <p style="margin: 5px 0 0 0;">
-                            Exportiert am: <?= e($preview['export_date']) ?> von <?= e($preview['exported_by']) ?>
+                    <div style="background: #e7f3ff; padding: 15px; border-radius: 5px; border-left: 4px solid #007bff; margin-bottom: 15px;">
+                        <h4 style="margin-top: 0;">QR-Code Validierung</h4>
+                        <p style="margin-bottom: 0; font-size: 14px;">
+                            Der Import prüft automatisch ob QR-Codes bereits existieren.
+                            Duplikate werden übersprungen.
                         </p>
                     </div>
                     
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;">
-                        <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center;">
-                            <div style="font-size: 32px; font-weight: bold; color: #007bff;">
-                                <?= count($preview['markers']) ?>
-                            </div>
-                            <div style="font-size: 14px; color: #6c757d;">Marker gesamt</div>
-                        </div>
-                        
-                        <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center;">
-                            <div style="font-size: 32px; font-weight: bold; color: #28a745;">
-                                <?php
-                                $withImages = 0;
-                                foreach ($preview['markers'] as $m) {
-                                    if (!empty($m['images_base64'])) $withImages++;
-                                }
-                                echo $withImages;
-                                ?>
-                            </div>
-                            <div style="font-size: 14px; color: #6c757d;">Mit Bildern</div>
-                        </div>
-                        
-                        <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center;">
-                            <div style="font-size: 32px; font-weight: bold; color: #ffc107;">
-                                <?php
-                                $withDocs = 0;
-                                foreach ($preview['markers'] as $m) {
-                                    if (!empty($m['documents_base64'])) $withDocs++;
-                                }
-                                echo $withDocs;
-                                ?>
-                            </div>
-                            <div style="font-size: 14px; color: #6c757d;">Mit Dokumenten</div>
-                        </div>
-                    </div>
+                    <h3 style="font-size: 16px; margin-top: 20px;">Import-Prüfungen:</h3>
+                    <ul style="list-style: none; padding: 0;">
+                        <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            QR-Code existiert nicht doppelt
+                        </li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            QR-Code wird automatisch im Pool registriert
+                        </li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            Custom Fields werden zugeordnet
+                        </li>
+                        <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            Bilder & Dokumente werden wiederhergestellt
+                        </li>
+                        <li style="padding: 8px 0;">
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            Öffentliche Dokumente behalten ihren Status
+                        </li>
+                    </ul>
                     
-                    <!-- Marker-Liste -->
-                    <h3 style="margin-top: 20px;">Marker-Übersicht:</h3>
-                    <div style="max-height: 400px; overflow-y: auto; border: 2px solid #dee2e6; border-radius: 5px; padding: 15px; background: white;">
-                        <?php foreach ($preview['markers'] as $index => $m): ?>
-                            <div style="padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center;">
-                                <div>
-                                    <strong><?= e($m['name']) ?></strong>
-                                    <?php if (!empty($m['serial_number'])): ?>
-                                        <small style="color: #6c757d;"> - SN: <?= e($m['serial_number']) ?></small>
-                                    <?php endif; ?>
-                                    <br>
-                                    <small style="color: #6c757d;">
-                                        RFID: <?= e($m['rfid_chip']) ?>
-                                        <?php if (!empty($m['category'])): ?>
-                                            | <?= e($m['category']) ?>
-                                        <?php endif; ?>
-                                    </small>
-                                </div>
-                                <?php
-                                // Prüfen ob existiert
-                                $stmt = $pdo->prepare("SELECT id FROM markers WHERE rfid_chip = ?");
-                                $stmt->execute([$m['rfid_chip']]);
-                                $exists = $stmt->fetchColumn();
-                                ?>
-                                <?php if ($exists): ?>
-                                    <span class="badge badge-warning">Existiert bereits</span>
-                                <?php else: ?>
-                                    <span class="badge badge-success">Neu</span>
-                                <?php endif; ?>
-                            </div>
-                        <?php endforeach; ?>
+                    <div style="background: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107; margin-top: 20px;">
+                        <strong><i class="fas fa-exclamation-triangle"></i> Hinweis:</strong>
+                        <p style="margin: 5px 0 0 0; font-size: 14px;">
+                            Marker mit bereits existierenden QR-Codes werden automatisch übersprungen.
+                            Prüfen Sie das Import-Ergebnis sorgfältig!
+                        </p>
                     </div>
-                    
-                    <!-- Import-Optionen -->
-                    <form method="POST" style="margin-top: 20px;">
-                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
-                        <input type="hidden" name="import_confirm" value="1">
-                        <input type="hidden" name="import_data" value="<?= htmlspecialchars(json_encode($preview)) ?>">
-                        
-                        <div class="form-group">
-                            <label style="display: flex; align-items: center; padding: 12px; background: #fff3cd; border-radius: 5px; cursor: pointer;">
-                                <input type="checkbox" name="overwrite_existing" value="1" style="margin-right: 10px;">
-                                <span>
-                                    <i class="fas fa-exclamation-triangle"></i> Existierende Marker überschreiben
-                                    <small style="display: block; color: #6c757d; margin-top: 4px;">
-                                        Wenn aktiviert, werden vorhandene Marker mit gleicher RFID aktualisiert
-                                    </small>
-                                </span>
-                            </label>
-                        </div>
-                        
-                        <div style="display: flex; gap: 10px;">
-                            <button type="submit" class="btn btn-success" style="flex: 1;">
-                                <i class="fas fa-check"></i> Import durchführen
-                            </button>
-                            <a href="import_markers.php" class="btn btn-secondary">
-                                <i class="fas fa-times"></i> Abbrechen
-                            </a>
-                        </div>
-                    </form>
                 </div>
-            <?php endif; ?>
+            </div>
         </div>
     </div>
     <?php include 'footer.php'; ?>

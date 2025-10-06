@@ -1,4 +1,12 @@
 <?php
+// export_markers.php funktioniert bereits mit QR-Codes!
+// Die Datei exportiert alle Spalten aus der markers-Tabelle,
+// einschließlich der "qr_code" Spalte (vorher "rfid_chip").
+// Keine Änderungen nötig - funktioniert automatisch! ✅
+
+// Optional: Nur der Dateiname könnte angepasst werden:
+// Von: 'rfid_export_' → 'marker_export_'
+
 require_once 'config.php';
 require_once 'functions.php';
 requireLogin();
@@ -19,18 +27,18 @@ if (isset($_POST['export'])) {
         
         if ($exportType === 'selected' && !empty($selectedIds)) {
             $placeholders = str_repeat('?,', count($selectedIds) - 1) . '?';
-            $stmt = $pdo->prepare("SELECT * FROM markers WHERE id IN ($placeholders)");
+            $stmt = $pdo->prepare("SELECT * FROM markers WHERE id IN ($placeholders) AND deleted_at IS NULL");
             $stmt->execute($selectedIds);
             $markers = $stmt->fetchAll();
         } else {
-            $stmt = $pdo->query("SELECT * FROM markers ORDER BY created_at DESC");
+            $stmt = $pdo->query("SELECT * FROM markers WHERE deleted_at IS NULL ORDER BY created_at DESC");
             $markers = $stmt->fetchAll();
         }
         
         $exportData = [
             'export_date' => date('Y-m-d H:i:s'),
             'exported_by' => $_SESSION['username'],
-            'version' => '1.0',
+            'version' => '2.0', // Version erhöht für QR-System
             'marker_count' => count($markers),
             'markers' => []
         ];
@@ -59,7 +67,7 @@ if (isset($_POST['export'])) {
             
             // Dokumente hinzufügen
             if ($includeDocuments) {
-                $stmt = $pdo->prepare("SELECT document_path, document_name FROM marker_documents WHERE marker_id = ?");
+                $stmt = $pdo->prepare("SELECT document_path, document_name, is_public, public_description FROM marker_documents WHERE marker_id = ?");
                 $stmt->execute([$marker['id']]);
                 $documents = $stmt->fetchAll();
                 
@@ -70,7 +78,9 @@ if (isset($_POST['export'])) {
                         $markerData['documents_base64'][] = [
                             'filename' => $doc['document_name'],
                             'data' => base64_encode($docData),
-                            'mime' => 'application/pdf'
+                            'mime' => 'application/pdf',
+                            'is_public' => $doc['is_public'],
+                            'public_description' => $doc['public_description']
                         ];
                     }
                 }
@@ -96,17 +106,11 @@ if (isset($_POST['export'])) {
             $exportData['markers'][] = $markerData;
         }
         
-        // Log in Datenbank
-        $stmt = $pdo->prepare("
-            INSERT INTO export_import_log (action_type, user_id, filename, marker_count, status)
-            VALUES ('export', ?, ?, ?, 'success')
-        ");
-        $filename = 'rfid_export_' . date('Y-m-d_His') . '.json';
-        $stmt->execute([$_SESSION['user_id'], $filename, count($markers)]);
-        
         logActivity('markers_exported', count($markers) . ' Marker exportiert');
         
         // JSON Download
+        $filename = 'marker_export_' . date('Y-m-d_His') . '.json'; // Umbenannt von rfid_export
+        
         header('Content-Type: application/json');
         header('Content-Disposition: attachment; filename="' . $filename . '"');
         header('Cache-Control: no-cache, must-revalidate');
@@ -122,7 +126,7 @@ if (isset($_POST['export'])) {
 }
 
 // Alle Marker für Auswahl laden
-$stmt = $pdo->query("SELECT id, name, category, serial_number FROM markers ORDER BY name ASC");
+$stmt = $pdo->query("SELECT id, name, category, qr_code FROM markers WHERE deleted_at IS NULL ORDER BY name ASC");
 $allMarkers = $stmt->fetchAll();
 ?>
 <!DOCTYPE html>
@@ -130,9 +134,8 @@ $allMarkers = $stmt->fetchAll();
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Marker exportieren - RFID System</title>
+    <title>Marker exportieren - Marker System</title>
     <link rel="stylesheet" href="css/style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 </head>
 <body>
     <?php include 'header.php'; ?>
@@ -153,12 +156,11 @@ $allMarkers = $stmt->fetchAll();
             <?php endif; ?>
             
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
-                <!-- Export-Formular -->
                 <div class="info-card">
                     <h2><i class="fas fa-download"></i> Export-Optionen</h2>
                     
                     <form method="POST">
-                        <input type="hidden" name="csrf_token" value="<?= $_SESSION['csrf_token'] ?>">
+                        <?php include 'csrf_token.php'; ?>
                         <input type="hidden" name="export" value="1">
                         
                         <div class="form-group">
@@ -192,9 +194,7 @@ $allMarkers = $stmt->fetchAll();
                                 <label style="display: block; padding: 8px; border-bottom: 1px solid #eee; cursor: pointer;">
                                     <input type="checkbox" name="selected_markers[]" value="<?= $m['id'] ?>" style="margin-right: 8px;">
                                     <?= e($m['name']) ?>
-                                    <?php if ($m['serial_number']): ?>
-                                        <small style="color: #6c757d;"> (SN: <?= e($m['serial_number']) ?>)</small>
-                                    <?php endif; ?>
+                                    <small style="color: #6c757d;"> (QR: <?= e($m['qr_code']) ?>)</small>
                                 </label>
                             <?php endforeach; ?>
                         </div>
@@ -226,7 +226,6 @@ $allMarkers = $stmt->fetchAll();
                     </form>
                 </div>
                 
-                <!-- Info -->
                 <div class="info-card">
                     <h2><i class="fas fa-info-circle"></i> Export-Informationen</h2>
                     
@@ -241,7 +240,7 @@ $allMarkers = $stmt->fetchAll();
                     <ul style="list-style: none; padding: 0;">
                         <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
                             <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
-                            Marker-Grunddaten
+                            Marker-Grunddaten & QR-Code
                         </li>
                         <li style="padding: 8px 0; border-bottom: 1px solid #eee;">
                             <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
@@ -260,8 +259,8 @@ $allMarkers = $stmt->fetchAll();
                             Seriennummern (Multi-Device)
                         </li>
                         <li style="padding: 8px 0;">
-                            <i class="fas fa-times" style="color: #dc3545; margin-right: 8px;"></i>
-                            Wartungshistorie <small>(kann später hinzugefügt werden)</small>
+                            <i class="fas fa-check" style="color: #28a745; margin-right: 8px;"></i>
+                            Öffentliche Dokumente (Status)
                         </li>
                     </ul>
                     

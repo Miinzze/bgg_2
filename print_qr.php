@@ -3,14 +3,37 @@ require_once 'config.php';
 require_once 'functions.php';
 requireLogin();
 
-$id = $_GET['id'] ?? 0;
-$marker = getMarkerById($id, $pdo);
+// Zwei Modi: Marker-ID ODER QR-Code direkt
+$markerId = $_GET['id'] ?? 0;
+$qrCode = $_GET['code'] ?? '';
 
-if (!$marker) {
-    die('Marker nicht gefunden');
+$marker = null;
+$isBlankCode = false;
+
+if ($markerId) {
+    // Marker mit ID laden
+    $marker = getMarkerById($markerId, $pdo);
+    if (!$marker) {
+        die('Marker nicht gefunden');
+    }
+    $qrCode = $marker['qr_code'];
+    $publicUrl = 'https://' . $_SERVER['HTTP_HOST'] . '/public_view.php?token=' . $marker['public_token'];
+} elseif ($qrCode) {
+    // Blanko QR-Code drucken (noch nicht zugewiesen)
+    $stmt = $pdo->prepare("SELECT * FROM qr_code_pool WHERE qr_code = ?");
+    $stmt->execute([$qrCode]);
+    $poolCode = $stmt->fetch();
+    
+    if (!$poolCode) {
+        die('QR-Code nicht gefunden');
+    }
+    
+    $isBlankCode = true;
+    $publicUrl = $qrCode; // Nur der Code selbst
+} else {
+    die('Keine ID oder QR-Code angegeben');
 }
 
-$publicUrl = 'https://' . $_SERVER['HTTP_HOST'] . '/public_view.php?token=' . $marker['public_token'];
 $qrApiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&data=' . urlencode($publicUrl);
 ?>
 <!DOCTYPE html>
@@ -18,7 +41,7 @@ $qrApiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>QR-Code - <?= e($marker['name']) ?></title>
+    <title>QR-Code - <?= $isBlankCode ? e($qrCode) : e($marker['name']) ?></title>
     <style>
         @page {
             size: A4;
@@ -44,6 +67,14 @@ $qrApiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&
             font-weight: bold;
             margin-bottom: 10px;
             color: #e63312;
+        }
+        
+        .qr-code-number {
+            font-size: 28px;
+            font-weight: bold;
+            font-family: 'Courier New', monospace;
+            color: #1976d2;
+            margin: 20px 0;
         }
         
         .marker-info {
@@ -73,6 +104,16 @@ $qrApiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&
             line-height: 1.6;
         }
         
+        .blank-code-instructions {
+            font-size: 16px;
+            color: #1976d2;
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            border-left: 4px solid #1976d2;
+        }
+        
         .footer {
             margin-top: 40px;
             padding-top: 20px;
@@ -94,36 +135,63 @@ $qrApiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&
 </head>
 <body>
     <div class="print-container">
-        <div class="marker-name">
-            <?= e($marker['name']) ?>
-        </div>
-        
-        <div class="marker-info">
-            <?php if ($marker['category']): ?>
-                Kategorie: <?= e($marker['category']) ?><br>
-            <?php endif; ?>
+        <?php if ($isBlankCode): ?>
+            <!-- Blanko QR-Code -->
+            <div class="qr-code-number"><?= e($qrCode) ?></div>
             
-            <?php if ($marker['serial_number']): ?>
-                Seriennummer: <?= e($marker['serial_number']) ?><br>
-            <?php endif; ?>
+            <div class="blank-code-instructions">
+                <strong>BLANKO QR-CODE</strong><br>
+                Noch nicht zugewiesen
+            </div>
             
-            RFID: <?= e($marker['rfid_chip']) ?>
-        </div>
-        
-        <div class="qr-code">
-            <img src="<?= $qrApiUrl ?>" alt="QR Code">
-        </div>
-        
-        <div class="instructions">
-            <strong>Scannen Sie diesen QR-Code mit Ihrem Smartphone</strong><br>
-            für sofortigen Zugriff auf alle Geräteinformationen,<br>
-            Wartungshistorie und Standortdaten.
-        </div>
+            <div class="qr-code">
+                <img src="<?= $qrApiUrl ?>" alt="QR Code">
+            </div>
+            
+            <div class="instructions">
+                <strong>So aktivieren Sie diesen QR-Code:</strong><br>
+                1. QR-Code am Gerät/Standort anbringen<br>
+                2. Mit Smartphone scannen<br>
+                3. GPS-Position erfassen<br>
+                4. Gerätedaten eingeben<br>
+                5. Marker wird automatisch aktiviert
+            </div>
+            
+        <?php else: ?>
+            <!-- Zugewiesener Marker -->
+            <div class="marker-name">
+                <?= e($marker['name']) ?>
+            </div>
+            
+            <div class="marker-info">
+                <?php if ($marker['category']): ?>
+                    Kategorie: <?= e($marker['category']) ?><br>
+                <?php endif; ?>
+                
+                <?php if ($marker['serial_number']): ?>
+                    Seriennummer: <?= e($marker['serial_number']) ?><br>
+                <?php endif; ?>
+                
+                QR-Code: <code style="font-family: 'Courier New', monospace; font-weight: bold;"><?= e($marker['qr_code']) ?></code>
+            </div>
+            
+            <div class="qr-code">
+                <img src="<?= $qrApiUrl ?>" alt="QR Code">
+            </div>
+            
+            <div class="instructions">
+                <strong>Scannen Sie diesen QR-Code mit Ihrem Smartphone</strong><br>
+                für sofortigen Zugriff auf alle Geräteinformationen,<br>
+                Wartungshistorie und Standortdaten.
+            </div>
+        <?php endif; ?>
         
         <div class="footer">
-            RFID Marker System<br>
+            Marker System<br>
             Erstellt am: <?= date('d.m.Y H:i') ?> Uhr<br>
-            ID: <?= $marker['id'] ?>
+            <?php if (!$isBlankCode): ?>
+                Marker-ID: <?= $marker['id'] ?>
+            <?php endif; ?>
         </div>
     </div>
     

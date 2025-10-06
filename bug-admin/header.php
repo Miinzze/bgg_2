@@ -40,6 +40,9 @@ $currentUser = getBugAdminInfo($_SESSION['bug_admin_id'], $pdo);
                             <i class="fas fa-users"></i> Benutzer
                         </a>
                     </li>
+                        <a href="patchnotes_admin.php" class="btn btn-secondary">
+                            <i class="fas fa-file-alt"></i> Patchnotes Erstellen
+                        </a>
                     <li>
                         <a href="../index.php" target="_blank">
                             <i class="fas fa-external-link-alt"></i> Hauptseite

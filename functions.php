@@ -1,387 +1,63 @@
 <?php
 // functions.php - Hilfsfunktionen
 
-// Prüfen ob mobiles Gerät (Smartphone oder Tablet)
-function isMobileDevice() {
-    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    
-    // Liste mobiler User-Agent-Patterns
-    $mobilePatterns = [
-        '/Android/i',
-        '/webOS/i',
-        '/iPhone/i',
-        '/iPad/i',
-        '/iPod/i',
-        '/BlackBerry/i',
-        '/Windows Phone/i',
-        '/Mobile/i',
-        '/Tablet/i'
-    ];
-    
-    foreach ($mobilePatterns as $pattern) {
-        if (preg_match($pattern, $userAgent)) {
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-// Prüfen ob Tablet (für spezifischere Unterscheidung wenn nötig)
-function isTablet() {
-    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    return preg_match('/(tablet|ipad|playbook|silk)|(android(?!.*mobile))/i', $userAgent);
-}
-
-// Prüfen ob Smartphone
-function isSmartphone() {
-    return isMobileDevice() && !isTablet();
-}
-
-// Prüfen ob Benutzer eingeloggt ist
-function isLoggedIn() {
-    return isset($_SESSION['user_id']);
-}
-
-// Prüfen ob Benutzer bestimmte Rolle hat
-function hasRole($role) {
-    return isset($_SESSION['role']) && $_SESSION['role'] === $role;
-}
-
-// Prüfen ob Benutzer Admin ist
-function isAdmin() {
-    return hasRole(ROLE_ADMIN);
-}
-
-// Prüfen ob Benutzer eine bestimmte Berechtigung hat
-function hasPermission($permissionKey) {
-    global $pdo;
-    
-    if (!isLoggedIn()) {
+// QR-Code validieren (ersetzt validateRFID)
+function validateQRCode($qrCode) {
+    // QR-Code Format: PREFIX-NUMMER (z.B. QR-0001)
+    // Mindestens 3 Zeichen
+    if (empty($qrCode) || strlen($qrCode) < 3) {
         return false;
     }
     
-    // Admin hat immer alle Rechte
-    if (isAdmin()) {
-        return true;
-    }
-    
-    $stmt = $pdo->prepare("
-        SELECT COUNT(*) 
-        FROM users u
-        JOIN role_permissions rp ON u.role_id = rp.role_id
-        JOIN permissions p ON rp.permission_id = p.id
-        WHERE u.id = ? AND p.permission_key = ?
-    ");
-    $stmt->execute([$_SESSION['user_id'], $permissionKey]);
-    
-    return $stmt->fetchColumn() > 0;
+    // Alphanumerisch plus Bindestrich erlaubt
+    return preg_match('/^[A-Za-z0-9\-]{3,100}$/', $qrCode);
 }
 
-// Alle Berechtigungen eines Benutzers abrufen
-function getUserPermissions($userId) {
-    global $pdo;
-    
+// Für Abwärtskompatibilität (falls irgendwo noch validateRFID aufgerufen wird)
+function validateRFID($rfid) {
+    return validateQRCode($rfid);
+}
+
+// QR-Code aus Pool abrufen
+function getQRCodeFromPool($qrCode, $pdo) {
     $stmt = $pdo->prepare("
-        SELECT p.permission_key, p.display_name, p.category
-        FROM users u
-        JOIN role_permissions rp ON u.role_id = rp.role_id
-        JOIN permissions p ON rp.permission_id = p.id
-        WHERE u.id = ?
-        ORDER BY p.category, p.display_name
+        SELECT * FROM qr_code_pool 
+        WHERE qr_code = ?
     ");
-    $stmt->execute([$userId]);
-    
+    $stmt->execute([$qrCode]);
+    return $stmt->fetch();
+}
+
+// Verfügbare (nicht zugewiesene) QR-Codes abrufen
+function getAvailableQRCodes($pdo, $limit = 100) {
+    $stmt = $pdo->prepare("
+        SELECT * FROM qr_code_pool 
+        WHERE is_assigned = 0 
+        ORDER BY qr_code ASC 
+        LIMIT ?
+    ");
+    $stmt->execute([$limit]);
     return $stmt->fetchAll();
 }
 
-// Berechtigung erforderlich - sonst Fehler
-function requirePermission($permissionKey, $errorMessage = 'Keine Berechtigung für diese Aktion') {
-    if (!hasPermission($permissionKey)) {
-        die('<h1>Zugriff verweigert</h1><p>' . htmlspecialchars($errorMessage) . '</p><a href="index.php">Zur Übersicht</a>');
-    }
+// QR-Code einem Marker zuweisen
+function assignQRCodeToMarker($qrCode, $markerId, $pdo) {
+    $stmt = $pdo->prepare("
+        UPDATE qr_code_pool 
+        SET is_assigned = 1, marker_id = ?, assigned_at = NOW()
+        WHERE qr_code = ? AND is_assigned = 0
+    ");
+    return $stmt->execute([$markerId, $qrCode]);
 }
 
-// Benutzer zur Login-Seite umleiten
-function requireLogin() {
-    if (!isLoggedIn()) {
-        header('Location: login.php');
-        exit;
-    }
-}
-
-// Admin-Rechte erforderlich
-function requireAdmin() {
-    requireLogin();
-    if (!isAdmin()) {
-        die('Zugriff verweigert. Admin-Rechte erforderlich.');
-    }
-}
-
-// HTML escapen
-function e($string) {
-    return htmlspecialchars($string, ENT_QUOTES, 'UTF-8');
-}
-
-// Erfolgs-/Fehlermeldungen anzeigen
-function showMessage($type, $message) {
-    return "<div class='alert alert-{$type}'>{$message}</div>";
-}
-
-// Bild hochladen
-function uploadImage($file, $markerId) {
-    $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-    $maxSize = 5 * 1024 * 1024; // 5MB
-    
-    // MIME-Type prüfen (kann gefälscht werden, aber erste Verteidigung)
-    if (!in_array($file['type'], $allowedTypes)) {
-        return ['success' => false, 'message' => 'Ungültiger Dateityp'];
-    }
-    
-    // Dateigröße prüfen
-    if ($file['size'] > $maxSize) {
-        return ['success' => false, 'message' => 'Datei zu groß (max. 5MB)'];
-    }
-    
-    // Extension prüfen
-    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    if (!in_array($extension, $allowedExtensions)) {
-        return ['success' => false, 'message' => 'Ungültige Dateiendung'];
-    }
-    
-    // KRITISCH: Echten Bildtyp mit getimagesize prüfen
-    $imageInfo = @getimagesize($file['tmp_name']);
-    if ($imageInfo === false) {
-        return ['success' => false, 'message' => 'Keine gültige Bilddatei'];
-    }
-    
-    // Nur erlaubte Bildtypen
-    $allowedImageTypes = [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_GIF, IMAGETYPE_WEBP];
-    if (!in_array($imageInfo[2], $allowedImageTypes)) {
-        return ['success' => false, 'message' => 'Bildtyp nicht erlaubt'];
-    }
-    
-    // Sicheren Dateinamen generieren (ohne Original-Name!)
-    $filename = uniqid('img_', true) . '_' . $markerId . '.' . $extension;
-    $filepath = UPLOAD_DIR . $filename;
-    
-    // Upload-Verzeichnis sichern
-    if (!is_dir(UPLOAD_DIR)) {
-        mkdir(UPLOAD_DIR, 0755, true);
-    }
-    
-    // .htaccess erstellen um PHP-Ausführung zu verhindern
-    $htaccess = UPLOAD_DIR . '.htaccess';
-    if (!file_exists($htaccess)) {
-        file_put_contents($htaccess, "php_flag engine off\nOptions -Indexes");
-    }
-    
-    if (move_uploaded_file($file['tmp_name'], $filepath)) {
-        // Dateiberechtigungen setzen
-        chmod($filepath, 0644);
-        return ['success' => true, 'path' => $filepath];
-    }
-    
-    return ['success' => false, 'message' => 'Upload fehlgeschlagen'];
-}
-
-// Nächstes Wartungsdatum berechnen
-function calculateNextMaintenance($lastMaintenance, $intervalMonths) {
-    $date = new DateTime($lastMaintenance);
-    $date->modify("+{$intervalMonths} months");
-    return $date->format('Y-m-d');
-}
-
-// Wartungsstatus prüfen und automatisch setzen
-function checkAndUpdateMaintenanceStatus($markerId, $pdo) {
-    $marker = getMarkerById($markerId, $pdo);
-    
-    if (!$marker || $marker['is_storage'] || $marker['is_multi_device']) {
-        return;
-    }
-    
-    $today = new DateTime();
-    $nextMaintenance = new DateTime($marker['next_maintenance']);
-    
-    // Wartung fällig?
-    if ($nextMaintenance <= $today) {
-        // Wenn vermietet: nur Flag setzen
-        if ($marker['rental_status'] === 'vermietet') {
-            $stmt = $pdo->prepare("UPDATE markers SET maintenance_required = TRUE WHERE id = ?");
-            $stmt->execute([$markerId]);
-        }
-        // Wenn verfügbar: automatisch auf Wartung setzen
-        elseif ($marker['rental_status'] === 'verfuegbar') {
-            $stmt = $pdo->prepare("UPDATE markers SET rental_status = 'wartung', maintenance_required = TRUE WHERE id = ?");
-            $stmt->execute([$markerId]);
-        }
-    }
-}
-
-// Status ändern mit Wartungslogik
-function changeRentalStatus($markerId, $newStatus, $pdo) {
-    $marker = getMarkerById($markerId, $pdo);
-    
-    if (!$marker || $marker['is_storage'] || $marker['is_multi_device']) {
-        return false;
-    }
-    
-    // Wenn von vermietet auf verfügbar und Wartung fällig → auf Wartung setzen
-    if ($marker['rental_status'] === 'vermietet' && $newStatus === 'verfuegbar' && $marker['maintenance_required']) {
-        $newStatus = 'wartung';
-    }
-    
-    $stmt = $pdo->prepare("UPDATE markers SET rental_status = ? WHERE id = ?");
-    return $stmt->execute([$newStatus, $markerId]);
-}
-
-// Marker-Farbe basierend auf Status
-function getMarkerColor($marker) {
-    if ($marker['is_multi_device']) {
-        return '#764ba2'; // Lila für Multi-Device
-    }
-    
-    if ($marker['is_storage']) {
-        return '#28a745'; // Grün für Lager
-    }
-    
-    if (empty($marker['rental_status'])) {
-        return '#3388ff'; // Blau als Standard (Verfügbar)
-    }
-    
-    switch ($marker['rental_status']) {
-        case 'verfuegbar':
-            return '#3388ff'; // Blau
-        case 'vermietet':
-            return '#ffc107'; // Gelb/Orange
-        case 'wartung':
-            return '#dc3545'; // Rot
-        default:
-            return '#e63312'; // Standard-Rot
-    }
-}
-
-// Status-Label
-function getRentalStatusLabel($status) {
-    if (empty($status)) {
-        return ['label' => 'Kein Status', 'class' => 'secondary'];
-    }
-    
-    $labels = [
-        'verfuegbar' => ['label' => 'Verfügbar', 'class' => 'success'],
-        'vermietet' => ['label' => 'Vermietet', 'class' => 'warning'],
-        'wartung' => ['label' => 'Wartung', 'class' => 'danger']
-    ];
-    
-    return $labels[$status] ?? ['label' => 'Unbekannt', 'class' => 'secondary'];
-}
-
-// Wartungsstatus prüfen
-function getMaintenanceStatus($nextMaintenance) {
-    if (!$nextMaintenance) {
-        return ['status' => 'none', 'label' => 'Keine', 'class' => 'secondary'];
-    }
-    
-    $today = new DateTime();
-    $next = new DateTime($nextMaintenance);
-    $diff = $today->diff($next);
-    
-    if ($next < $today) {
-        return ['status' => 'overdue', 'label' => 'Überfällig', 'class' => 'danger'];
-    } elseif ($diff->days <= 30) {
-        return ['status' => 'soon', 'label' => 'Bald fällig', 'class' => 'warning'];
-    } else {
-        return ['status' => 'ok', 'label' => 'OK', 'class' => 'success'];
-    }
-}
-
-// System-Einstellungen aus Datenbank laden
-function getSystemSettings() {
-    global $pdo;
-    
-    // Default-Werte für ALLE Einstellungen
-    $defaultSettings = [
-        'map_default_lat' => '49.995567',
-        'map_default_lng' => '9.0731267',
-        'map_default_zoom' => '15',
-        'marker_size' => 'medium',
-        'marker_pulse' => '0',
-        'marker_hover_scale' => '0',
-        'show_map_legend' => '0',
-        'show_system_messages' => '0',
-        'system_name' => 'RFID Marker System',
-        'system_logo' => '',
-        'maintenance_check_days_before' => '7',
-        'email_enabled' => '0',
-        'email_from' => '',
-        'email_from_name' => 'RFID System'
-    ];
-    
-    try {
-        $stmt = $pdo->query("SELECT setting_key, setting_value FROM system_settings");
-        $dbSettings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
-        
-        // DB-Werte überschreiben Defaults
-        return array_merge($defaultSettings, $dbSettings);
-        
-    } catch (PDOException $e) {
-        error_log('Settings load error: ' . $e->getMessage());
-        return $defaultSettings;
-    }
-}
-
-// Einzelne Einstellung speichern
-function saveSetting($key, $value) {
-    global $pdo;
-    
-    try {
-        $stmt = $pdo->prepare("
-            INSERT INTO system_settings (setting_key, setting_value) 
-            VALUES (?, ?) 
-            ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
-        ");
-        return $stmt->execute([$key, $value]);
-    } catch (PDOException $e) {
-        error_log('Setting save error: ' . $e->getMessage());
-        return false;
-    }
-}
-
-// Mehrere Einstellungen auf einmal speichern
-function saveSettings($settings) {
-    global $pdo;
-    
-    try {
-        $pdo->beginTransaction();
-        
-        foreach ($settings as $key => $value) {
-            // Boolean in String '1' oder '0' konvertieren
-            if (is_bool($value)) {
-                $value = $value ? '1' : '0';
-            }
-            
-            $stmt = $pdo->prepare("
-                INSERT INTO system_settings (setting_key, setting_value) 
-                VALUES (?, ?) 
-                ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
-            ");
-            $stmt->execute([$key, $value]);
-        }
-        
-        $pdo->commit();
-        return true;
-    } catch (PDOException $e) {
-        $pdo->rollBack();
-        error_log('Settings save error: ' . $e->getMessage());
-        return false;
-    }
-}
-
-// RFID-Chip validieren
-function validateRFID($rfid) {
-    // Mindestens 8 alphanumerische Zeichen
-    return preg_match('/^[A-Za-z0-9]{8,}$/', $rfid);
+// QR-Code von Marker entfernen (bei Marker-Löschung)
+function unassignQRCodeFromMarker($qrCode, $pdo) {
+    $stmt = $pdo->prepare("
+        UPDATE qr_code_pool 
+        SET is_assigned = 0, marker_id = NULL, assigned_at = NULL
+        WHERE qr_code = ?
+    ");
+    return $stmt->execute([$qrCode]);
 }
 
 // Seriennummer validieren (nur Zahlen)
@@ -393,94 +69,6 @@ function validateSerialNumber($serialNumber) {
     // Nur Zahlen erlaubt
     return preg_match('/^[0-9]+$/', $serialNumber);
 }
-
-// Benutzer-Informationen abrufen
-function getUserInfo($userId, $pdo) {
-    $stmt = $pdo->prepare("
-        SELECT u.*, r.display_name as role_display_name
-        FROM users u
-        LEFT JOIN roles r ON u.role_id = r.id
-        WHERE u.id = ?
-    ");
-    $stmt->execute([$userId]);
-    return $stmt->fetch();
-}
-
-// Alle Marker abrufen
-function getAllMarkers($pdo) {
-    $stmt = $pdo->query("
-        SELECT m.*, u.username as created_by_name 
-        FROM markers m 
-        LEFT JOIN users u ON m.created_by = u.id 
-        ORDER BY m.created_at DESC
-    ");
-    return $stmt->fetchAll();
-}
-
-// Marker nach ID abrufen
-function getMarkerById($id, $pdo) {
-    $stmt = $pdo->prepare("
-        SELECT m.*, u.username as created_by_name 
-        FROM markers m 
-        LEFT JOIN users u ON m.created_by = u.id 
-        WHERE m.id = ? AND m.deleted_at IS NULL
-    ");
-    $stmt->execute([$id]);
-    return $stmt->fetch();
-}
-
-// Bilder eines Markers abrufen
-function getMarkerImages($markerId, $pdo) {
-    $stmt = $pdo->prepare("SELECT * FROM marker_images WHERE marker_id = ? ORDER BY uploaded_at DESC");
-    $stmt->execute([$markerId]);
-    return $stmt->fetchAll();
-}
-
-// Seriennummern eines Multi-Device Markers abrufen
-function getMarkerSerialNumbers($markerId, $pdo) {
-    $stmt = $pdo->prepare("
-        SELECT serial_number, created_at 
-        FROM marker_serial_numbers 
-        WHERE marker_id = ? 
-        ORDER BY created_at ASC
-    ");
-    $stmt->execute([$markerId]);
-    return $stmt->fetchAll();
-}
-
-// Datum formatieren (Deutsch)
-function formatDate($date, $format = 'd.m.Y') {
-    if (!$date) return '-';
-    $dt = new DateTime($date);
-    return $dt->format($format);
-}
-
-// Datum + Zeit formatieren (Deutsch)
-function formatDateTime($datetime, $format = 'd.m.Y H:i') {
-    if (!$datetime) return '-';
-    $dt = new DateTime($datetime);
-    return $dt->format($format);
-}
-
-// Prüfen ob Marker Multi-Device ist
-function isMultiDevice($marker) {
-    return !empty($marker['is_multi_device']);
-}
-
-// Prüfen ob Marker Lagergerät ist
-function isStorageDevice($marker) {
-    return !empty($marker['is_storage']);
-}
-
-// Debug-Funktion (nur für Entwicklung)
-function debug($data, $die = false) {
-    echo '<pre style="background: #f4f4f4; padding: 10px; border: 1px solid #ddd; margin: 10px;">';
-    print_r($data);
-    echo '</pre>';
-    if ($die) die();
-}
-
-// ==================== INPUT VALIDIERUNG ====================
 
 // GPS-Koordinaten validieren
 function validateCoordinates($lat, $lng) {
@@ -567,44 +155,276 @@ function validateUsername($username) {
     return preg_match('/^[a-zA-Z0-9_]+$/', $username);
 }
 
-// Passwort-Stärke prüfen
-function validatePasswordStrength($password) {
-    if (strlen($password) < 8) {
-        return ['valid' => false, 'message' => 'Passwort muss mindestens 8 Zeichen lang sein'];
-    }
-    if (!preg_match('/[A-Z]/', $password)) {
-        return ['valid' => false, 'message' => 'Passwort muss mindestens einen Großbuchstaben enthalten'];
-    }
-    if (!preg_match('/[a-z]/', $password)) {
-        return ['valid' => false, 'message' => 'Passwort muss mindestens einen Kleinbuchstaben enthalten'];
-    }
-    if (!preg_match('/[0-9]/', $password)) {
-        return ['valid' => false, 'message' => 'Passwort muss mindestens eine Zahl enthalten'];
-    }
-    return ['valid' => true, 'message' => ''];
-}
-
 // String-Länge validieren
 function validateStringLength($string, $min = 1, $max = 255) {
     $length = mb_strlen($string);
     return $length >= $min && $length <= $max;
 }
 
-// Zoom-Level validieren
-function validateZoomLevel($zoom) {
-    return validateInteger($zoom, 1, 19);
+// Prüfen ob mobiles Gerät (Smartphone oder Tablet)
+function isMobileDevice() {
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    
+    $mobilePatterns = [
+        '/Android/i',
+        '/webOS/i',
+        '/iPhone/i',
+        '/iPad/i',
+        '/iPod/i',
+        '/BlackBerry/i',
+        '/Windows Phone/i',
+        '/Mobile/i',
+        '/Tablet/i'
+    ];
+    
+    foreach ($mobilePatterns as $pattern) {
+        if (preg_match($pattern, $userAgent)) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
-// Kategorie-Name validieren (nur alphanumerisch, Leerzeichen, Bindestriche)
-function validateCategoryName($name) {
-    if (empty($name) || !validateStringLength($name, 1, 50)) {
+// Prüfen ob Benutzer eingeloggt ist
+function isLoggedIn() {
+    return isset($_SESSION['user_id']);
+}
+
+// Prüfen ob Benutzer Admin ist
+function isAdmin() {
+    return isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
+}
+
+// Prüfen ob Benutzer eine bestimmte Berechtigung hat
+function hasPermission($permissionKey) {
+    global $pdo;
+    
+    if (!isLoggedIn()) {
         return false;
     }
-    return preg_match('/^[a-zA-ZäöüÄÖÜß0-9\s\-]+$/u', $name);
+    
+    // Admin hat immer alle Rechte
+    if (isAdmin()) {
+        return true;
+    }
+    
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) 
+        FROM users u
+        JOIN role_permissions rp ON u.role_id = rp.role_id
+        JOIN permissions p ON rp.permission_id = p.id
+        WHERE u.id = ? AND p.permission_key = ?
+    ");
+    $stmt->execute([$_SESSION['user_id'], $permissionKey]);
+    
+    return $stmt->fetchColumn() > 0;
 }
 
-// ==================== AKTIVITÄTSPROTOKOLL ====================
+// Benutzer zur Login-Seite umleiten
+function requireLogin() {
+    if (!isLoggedIn()) {
+        header('Location: login.php');
+        exit;
+    }
+}
 
+// Admin-Rechte erforderlich
+function requireAdmin() {
+    requireLogin();
+    if (!isAdmin()) {
+        die('Zugriff verweigert. Admin-Rechte erforderlich.');
+    }
+}
+
+// HTML escapen
+function e($string) {
+    return htmlspecialchars($string, ENT_QUOTES, 'UTF-8');
+}
+
+// Bild hochladen
+function uploadImage($file, $markerId) {
+    $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+    $maxSize = 5 * 1024 * 1024; // 5MB
+    
+    if (!in_array($file['type'], $allowedTypes)) {
+        return ['success' => false, 'message' => 'Ungültiger Dateityp'];
+    }
+    
+    if ($file['size'] > $maxSize) {
+        return ['success' => false, 'message' => 'Datei zu groß (max. 5MB)'];
+    }
+    
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if (!in_array($extension, $allowedExtensions)) {
+        return ['success' => false, 'message' => 'Ungültige Dateiendung'];
+    }
+    
+    $imageInfo = @getimagesize($file['tmp_name']);
+    if ($imageInfo === false) {
+        return ['success' => false, 'message' => 'Keine gültige Bilddatei'];
+    }
+    
+    $allowedImageTypes = [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_GIF, IMAGETYPE_WEBP];
+    if (!in_array($imageInfo[2], $allowedImageTypes)) {
+        return ['success' => false, 'message' => 'Bildtyp nicht erlaubt'];
+    }
+    
+    $filename = uniqid('img_', true) . '_' . $markerId . '.' . $extension;
+    $filepath = UPLOAD_DIR . $filename;
+    
+    if (!is_dir(UPLOAD_DIR)) {
+        mkdir(UPLOAD_DIR, 0755, true);
+    }
+    
+    $htaccess = UPLOAD_DIR . '.htaccess';
+    if (!file_exists($htaccess)) {
+        file_put_contents($htaccess, "php_flag engine off\nOptions -Indexes");
+    }
+    
+    if (move_uploaded_file($file['tmp_name'], $filepath)) {
+        chmod($filepath, 0644);
+        return ['success' => true, 'path' => $filepath];
+    }
+    
+    return ['success' => false, 'message' => 'Upload fehlgeschlagen'];
+}
+
+// PDF validieren und hochladen
+function validatePDF($file) {
+    $allowedMime = ['application/pdf'];
+    $maxSize = 10 * 1024 * 1024; // 10MB
+    
+    if (!in_array($file['type'], $allowedMime)) {
+        return ['success' => false, 'message' => 'Nur PDF-Dateien erlaubt'];
+    }
+    
+    if ($file['size'] > $maxSize) {
+        return ['success' => false, 'message' => 'Datei zu groß (max. 10MB)'];
+    }
+    
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mimeType = finfo_file($finfo, $file['tmp_name']);
+    finfo_close($finfo);
+    
+    if ($mimeType !== 'application/pdf') {
+        return ['success' => false, 'message' => 'Keine gültige PDF-Datei'];
+    }
+    
+    return ['success' => true];
+}
+
+function uploadPDF($file, $markerId) {
+    $validation = validatePDF($file);
+    if (!$validation['success']) {
+        return $validation;
+    }
+    
+    $uploadDir = UPLOAD_DIR . 'documents/';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0755, true);
+    }
+    
+    $filename = 'doc_' . uniqid() . '_' . $markerId . '.pdf';
+    $filepath = $uploadDir . $filename;
+    
+    if (move_uploaded_file($file['tmp_name'], $filepath)) {
+        chmod($filepath, 0644);
+        return ['success' => true, 'path' => $filepath, 'size' => $file['size']];
+    }
+    
+    return ['success' => false, 'message' => 'Upload fehlgeschlagen'];
+}
+
+// Nächstes Wartungsdatum berechnen
+function calculateNextMaintenance($lastMaintenance, $intervalMonths) {
+    $date = new DateTime($lastMaintenance);
+    $date->modify("+{$intervalMonths} months");
+    return $date->format('Y-m-d');
+}
+
+// Marker-Farbe basierend auf Status
+function getMarkerColor($marker) {
+    if ($marker['is_multi_device']) {
+        return '#764ba2'; // Lila für Multi-Device
+    }
+    
+    if ($marker['is_storage']) {
+        return '#28a745'; // Grün für Lager
+    }
+    
+    if (empty($marker['rental_status'])) {
+        return '#3388ff'; // Blau als Standard
+    }
+    
+    switch ($marker['rental_status']) {
+        case 'verfuegbar':
+            return '#3388ff'; // Blau
+        case 'vermietet':
+            return '#ffc107'; // Gelb/Orange
+        case 'wartung':
+            return '#dc3545'; // Rot
+        default:
+            return '#e63312';
+    }
+}
+
+// System-Einstellungen laden
+function getSystemSettings() {
+    global $pdo;
+    
+    $defaultSettings = [
+        'map_default_lat' => '49.995567',
+        'map_default_lng' => '9.0731267',
+        'map_default_zoom' => '15',
+        'marker_size' => 'medium',
+        'marker_pulse' => '0',
+        'marker_hover_scale' => '0',
+        'show_map_legend' => '0',
+        'show_system_messages' => '0',
+        'system_name' => 'Marker System',
+        'maintenance_check_days_before' => '7',
+        'email_enabled' => '0',
+        'email_from' => '',
+        'email_from_name' => 'Marker System'
+    ];
+    
+    try {
+        $stmt = $pdo->query("SELECT setting_key, setting_value FROM system_settings");
+        $dbSettings = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+        return array_merge($defaultSettings, $dbSettings);
+    } catch (PDOException $e) {
+        error_log('Settings load error: ' . $e->getMessage());
+        return $defaultSettings;
+    }
+}
+
+// Marker nach ID abrufen
+function getMarkerById($id, $pdo) {
+    $stmt = $pdo->prepare("
+        SELECT m.*, u.username as created_by_name 
+        FROM markers m 
+        LEFT JOIN users u ON m.created_by = u.id 
+        WHERE m.id = ? AND m.deleted_at IS NULL
+    ");
+    $stmt->execute([$id]);
+    return $stmt->fetch();
+}
+
+// Alle Marker abrufen
+function getAllMarkers($pdo) {
+    $stmt = $pdo->query("
+        SELECT m.*, u.username as created_by_name 
+        FROM markers m 
+        LEFT JOIN users u ON m.created_by = u.id 
+        WHERE m.deleted_at IS NULL
+        ORDER BY m.created_at DESC
+    ");
+    return $stmt->fetchAll();
+}
+
+// Aktivitätsprotokoll
 function logActivity($action, $details = '', $markerId = null) {
     global $pdo;
     
@@ -626,60 +446,273 @@ function logActivity($action, $details = '', $markerId = null) {
             $details,
             $markerId,
             $ipAddress,
-            substr($userAgent, 0, 500) // Kürzen auf 500 Zeichen
+            substr($userAgent, 0, 500)
         ]);
     } catch (Exception $e) {
-        // Fehler nicht nach außen werfen, nur loggen
         error_log('Activity Log Fehler: ' . $e->getMessage());
     }
 }
 
-// PDF validieren
-function validatePDF($file) {
-    $allowedMime = ['application/pdf'];
-    $maxSize = 10 * 1024 * 1024; // 10MB
-    
-    if (!in_array($file['type'], $allowedMime)) {
-        return ['success' => false, 'message' => 'Nur PDF-Dateien erlaubt'];
-    }
-    
-    if ($file['size'] > $maxSize) {
-        return ['success' => false, 'message' => 'Datei zu groß (max. 10MB)'];
-    }
-    
-    // Prüfen ob wirklich PDF
-    $finfo = finfo_open(FILEINFO_MIME_TYPE);
-    $mimeType = finfo_file($finfo, $file['tmp_name']);
-    finfo_close($finfo);
-    
-    if ($mimeType !== 'application/pdf') {
-        return ['success' => false, 'message' => 'Keine gültige PDF-Datei'];
-    }
-    
-    return ['success' => true];
+// Datum formatieren
+function formatDate($date, $format = 'd.m.Y') {
+    if (!$date) return '-';
+    $dt = new DateTime($date);
+    return $dt->format($format);
 }
 
-// PDF hochladen
-function uploadPDF($file, $markerId) {
-    $validation = validatePDF($file);
-    if (!$validation['success']) {
-        return $validation;
+// Datum + Zeit formatieren
+function formatDateTime($datetime, $format = 'd.m.Y H:i') {
+    if (!$datetime) return '-';
+    $dt = new DateTime($datetime);
+    return $dt->format($format);
+}
+
+// Prüfen ob Tablet (für spezifischere Unterscheidung wenn nötig)
+function isTablet() {
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    return preg_match('/(tablet|ipad|playbook|silk)|(android(?!.*mobile))/i', $userAgent);
+}
+
+// Prüfen ob Smartphone
+function isSmartphone() {
+    return isMobileDevice() && !isTablet();
+}
+
+// Prüfen ob Benutzer bestimmte Rolle hat
+function hasRole($role) {
+    return isset($_SESSION['role']) && $_SESSION['role'] === $role;
+}
+
+// Alle Berechtigungen eines Benutzers abrufen
+function getUserPermissions($userId) {
+    global $pdo;
+    
+    $stmt = $pdo->prepare("
+        SELECT p.permission_key, p.display_name, p.category
+        FROM users u
+        JOIN role_permissions rp ON u.role_id = rp.role_id
+        JOIN permissions p ON rp.permission_id = p.id
+        WHERE u.id = ?
+        ORDER BY p.category, p.display_name
+    ");
+    $stmt->execute([$userId]);
+    
+    return $stmt->fetchAll();
+}
+
+// Berechtigung erforderlich - sonst Fehler
+function requirePermission($permissionKey, $errorMessage = 'Keine Berechtigung für diese Aktion') {
+    if (!hasPermission($permissionKey)) {
+        die('<h1>Zugriff verweigert</h1><p>' . htmlspecialchars($errorMessage) . '</p><a href="index.php">Zur Übersicht</a>');
+    }
+}
+
+// Erfolgs-/Fehlermeldungen anzeigen
+function showMessage($type, $message) {
+    return "<div class='alert alert-{$type}'>{$message}</div>";
+}
+
+// Wartungsstatus prüfen und automatisch setzen
+function checkAndUpdateMaintenanceStatus($markerId, $pdo) {
+    $marker = getMarkerById($markerId, $pdo);
+    
+    if (!$marker || $marker['is_storage'] || $marker['is_multi_device']) {
+        return;
     }
     
-    $uploadDir = UPLOAD_DIR . 'documents/';
-    if (!is_dir($uploadDir)) {
-        mkdir($uploadDir, 0755, true);
+    $today = new DateTime();
+    $nextMaintenance = new DateTime($marker['next_maintenance']);
+    
+    // Wartung fällig?
+    if ($nextMaintenance <= $today) {
+        // Wenn vermietet: nur Flag setzen
+        if ($marker['rental_status'] === 'vermietet') {
+            $stmt = $pdo->prepare("UPDATE markers SET maintenance_required = TRUE WHERE id = ?");
+            $stmt->execute([$markerId]);
+        }
+        // Wenn verfügbar: automatisch auf Wartung setzen
+        elseif ($marker['rental_status'] === 'verfuegbar') {
+            $stmt = $pdo->prepare("UPDATE markers SET rental_status = 'wartung', maintenance_required = TRUE WHERE id = ?");
+            $stmt->execute([$markerId]);
+        }
+    }
+}
+
+// Status ändern mit Wartungslogik
+function changeRentalStatus($markerId, $newStatus, $pdo) {
+    $marker = getMarkerById($markerId, $pdo);
+    
+    if (!$marker || $marker['is_storage'] || $marker['is_multi_device']) {
+        return false;
     }
     
-    $filename = 'doc_' . uniqid() . '_' . $markerId . '.pdf';
-    $filepath = $uploadDir . $filename;
-    
-    if (move_uploaded_file($file['tmp_name'], $filepath)) {
-        chmod($filepath, 0644);
-        return ['success' => true, 'path' => $filepath, 'size' => $file['size']];
+    // Wenn von vermietet auf verfügbar und Wartung fällig → auf Wartung setzen
+    if ($marker['rental_status'] === 'vermietet' && $newStatus === 'verfuegbar' && $marker['maintenance_required']) {
+        $newStatus = 'wartung';
     }
     
-    return ['success' => false, 'message' => 'Upload fehlgeschlagen'];
+    $stmt = $pdo->prepare("UPDATE markers SET rental_status = ? WHERE id = ?");
+    return $stmt->execute([$newStatus, $markerId]);
+}
+
+// Status-Label
+function getRentalStatusLabel($status) {
+    if (empty($status)) {
+        return ['label' => 'Kein Status', 'class' => 'secondary'];
+    }
+    
+    $labels = [
+        'verfuegbar' => ['label' => 'Verfügbar', 'class' => 'success'],
+        'vermietet' => ['label' => 'Vermietet', 'class' => 'warning'],
+        'wartung' => ['label' => 'Wartung', 'class' => 'danger']
+    ];
+    
+    return $labels[$status] ?? ['label' => 'Unbekannt', 'class' => 'secondary'];
+}
+
+// Wartungsstatus prüfen
+function getMaintenanceStatus($nextMaintenance) {
+    if (!$nextMaintenance) {
+        return ['status' => 'none', 'label' => 'Keine', 'class' => 'secondary'];
+    }
+    
+    $today = new DateTime();
+    $next = new DateTime($nextMaintenance);
+    $diff = $today->diff($next);
+    
+    if ($next < $today) {
+        return ['status' => 'overdue', 'label' => 'Überfällig', 'class' => 'danger'];
+    } elseif ($diff->days <= 30) {
+        return ['status' => 'soon', 'label' => 'Bald fällig', 'class' => 'warning'];
+    } else {
+        return ['status' => 'ok', 'label' => 'OK', 'class' => 'success'];
+    }
+}
+
+// Einzelne Einstellung speichern
+function saveSetting($key, $value) {
+    global $pdo;
+    
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO system_settings (setting_key, setting_value) 
+            VALUES (?, ?) 
+            ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+        ");
+        return $stmt->execute([$key, $value]);
+    } catch (PDOException $e) {
+        error_log('Setting save error: ' . $e->getMessage());
+        return false;
+    }
+}
+
+// Mehrere Einstellungen auf einmal speichern
+function saveSettings($settings) {
+    global $pdo;
+    
+    try {
+        $pdo->beginTransaction();
+        
+        foreach ($settings as $key => $value) {
+            // Boolean in String '1' oder '0' konvertieren
+            if (is_bool($value)) {
+                $value = $value ? '1' : '0';
+            }
+            
+            $stmt = $pdo->prepare("
+                INSERT INTO system_settings (setting_key, setting_value) 
+                VALUES (?, ?) 
+                ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+            ");
+            $stmt->execute([$key, $value]);
+        }
+        
+        $pdo->commit();
+        return true;
+    } catch (PDOException $e) {
+        $pdo->rollBack();
+        error_log('Settings save error: ' . $e->getMessage());
+        return false;
+    }
+}
+
+// Benutzer-Informationen abrufen
+function getUserInfo($userId, $pdo) {
+    $stmt = $pdo->prepare("
+        SELECT u.*, r.display_name as role_display_name
+        FROM users u
+        LEFT JOIN roles r ON u.role_id = r.id
+        WHERE u.id = ?
+    ");
+    $stmt->execute([$userId]);
+    return $stmt->fetch();
+}
+
+// Bilder eines Markers abrufen
+function getMarkerImages($markerId, $pdo) {
+    $stmt = $pdo->prepare("SELECT * FROM marker_images WHERE marker_id = ? ORDER BY uploaded_at DESC");
+    $stmt->execute([$markerId]);
+    return $stmt->fetchAll();
+}
+
+// Seriennummern eines Multi-Device Markers abrufen
+function getMarkerSerialNumbers($markerId, $pdo) {
+    $stmt = $pdo->prepare("
+        SELECT serial_number, created_at 
+        FROM marker_serial_numbers 
+        WHERE marker_id = ? 
+        ORDER BY created_at ASC
+    ");
+    $stmt->execute([$markerId]);
+    return $stmt->fetchAll();
+}
+
+// Prüfen ob Marker Multi-Device ist
+function isMultiDevice($marker) {
+    return !empty($marker['is_multi_device']);
+}
+
+// Prüfen ob Marker Lagergerät ist
+function isStorageDevice($marker) {
+    return !empty($marker['is_storage']);
+}
+
+// Debug-Funktion (nur für Entwicklung)
+function debug($data, $die = false) {
+    echo '<pre style="background: #f4f4f4; padding: 10px; border: 1px solid #ddd; margin: 10px;">';
+    print_r($data);
+    echo '</pre>';
+    if ($die) die();
+}
+
+// Passwort-Stärke prüfen
+function validatePasswordStrength($password) {
+    if (strlen($password) < 8) {
+        return ['valid' => false, 'message' => 'Passwort muss mindestens 8 Zeichen lang sein'];
+    }
+    if (!preg_match('/[A-Z]/', $password)) {
+        return ['valid' => false, 'message' => 'Passwort muss mindestens einen Großbuchstaben enthalten'];
+    }
+    if (!preg_match('/[a-z]/', $password)) {
+        return ['valid' => false, 'message' => 'Passwort muss mindestens einen Kleinbuchstaben enthalten'];
+    }
+    if (!preg_match('/[0-9]/', $password)) {
+        return ['valid' => false, 'message' => 'Passwort muss mindestens eine Zahl enthalten'];
+    }
+    return ['valid' => true, 'message' => ''];
+}
+
+// Zoom-Level validieren
+function validateZoomLevel($zoom) {
+    return validateInteger($zoom, 1, 19);
+}
+
+// Kategorie-Name validieren (nur alphanumerisch, Leerzeichen, Bindestriche)
+function validateCategoryName($name) {
+    if (empty($name) || !validateStringLength($name, 1, 50)) {
+        return false;
+    }
+    return preg_match('/^[a-zA-ZäöüÄÖÜß0-9\s\-]+$/u', $name);
 }
 
 // ==================== USAGE TRACKING ====================

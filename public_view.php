@@ -1,255 +1,454 @@
 <?php
 require_once 'config.php';
+require_once 'functions.php';
 
+// Kein Login erforderlich - öffentliche Ansicht!
+// Token aus URL holen
 $token = $_GET['token'] ?? '';
 
 if (empty($token)) {
-    die('Ungültiger Zugriff');
+    die('Kein Token angegeben');
 }
 
-// Marker über Token abrufen
-$stmt = $pdo->prepare("SELECT * FROM markers WHERE public_token = ?");
+// Marker mit Token laden
+$stmt = $pdo->prepare("
+    SELECT m.*, u.username as created_by_name,
+           c.name as category_name, c.icon as category_icon, c.color as category_color
+    FROM markers m
+    LEFT JOIN users u ON m.created_by = u.id
+    LEFT JOIN categories c ON m.category = c.name
+    WHERE m.public_token = ? AND m.deleted_at IS NULL
+");
 $stmt->execute([$token]);
 $marker = $stmt->fetch();
 
 if (!$marker) {
-    die('Marker nicht gefunden');
+    die('Marker nicht gefunden oder nicht öffentlich zugänglich');
 }
 
-// Bilder abrufen
-$stmt = $pdo->prepare("SELECT * FROM marker_images WHERE marker_id = ? ORDER BY uploaded_at DESC");
-$stmt->execute([$marker['id']]);
-$images = $stmt->fetchAll();
+// Bilder laden
+$images = getMarkerImages($marker['id'], $pdo);
 
-// Seriennummern bei Multi-Device
+// Seriennummern laden (bei Multi-Device)
 $serialNumbers = [];
 if ($marker['is_multi_device']) {
-    $stmt = $pdo->prepare("SELECT serial_number, created_at FROM marker_serial_numbers WHERE marker_id = ? ORDER BY created_at ASC");
-    $stmt->execute([$marker['id']]);
-    $serialNumbers = $stmt->fetchAll();
+    $serialNumbers = getMarkerSerialNumbers($marker['id'], $pdo);
 }
 
-// Status-Label
-function getStatusLabel($status) {
-    $labels = [
-        'verfuegbar' => ['label' => 'Verfügbar', 'class' => 'success'],
-        'vermietet' => ['label' => 'Vermietet', 'class' => 'warning'],
-        'wartung' => ['label' => 'Wartung', 'class' => 'danger']
-    ];
-    return $labels[$status] ?? ['label' => 'Unbekannt', 'class' => 'secondary'];
-}
+// ÖFFENTLICHE Dokumente laden
+$stmt = $pdo->prepare("
+    SELECT id, document_name, document_path, file_size, public_description, uploaded_at
+    FROM marker_documents
+    WHERE marker_id = ? AND is_public = 1
+    ORDER BY uploaded_at DESC
+");
+$stmt->execute([$marker['id']]);
+$publicDocuments = $stmt->fetchAll();
 
-$statusInfo = getStatusLabel($marker['rental_status']);
-
-function e($string) {
-    return htmlspecialchars($string, ENT_QUOTES, 'UTF-8');
-}
+// Wartungsstatus
+$maintenanceStatus = getMaintenanceStatus($marker['next_maintenance']);
+$rentalStatus = getRentalStatusLabel($marker['rental_status']);
 ?>
 <!DOCTYPE html>
 <html lang="de">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><?= e($marker['name']) ?> - Info</title>
-    <link rel="stylesheet" href="style.css">
+    <title><?= e($marker['name']) ?> - Öffentliche Ansicht</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
-        body {
-            background: #f5f5f5;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        .public-header {
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
+            padding: 30px;
             text-align: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
-        .public-header h1 {
-            margin: 0;
-            font-size: 28px;
+        
+        .header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
         }
-        .public-header p {
-            margin: 10px 0 0 0;
+        
+        .header .qr-code {
+            font-family: 'Courier New', monospace;
+            font-size: 18px;
             opacity: 0.9;
         }
-        .readonly-badge {
-            background: #ffc107;
-            color: #333;
-            padding: 8px 15px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            display: inline-block;
-            margin-top: 10px;
+        
+        .content {
+            padding: 30px;
         }
-        .serial-numbers-list {
+        
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .info-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .info-card h3 {
+            color: #495057;
+            font-size: 14px;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        
+        .info-card .value {
+            font-size: 20px;
+            color: #212529;
+            font-weight: bold;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        
+        .badge-success { background: #d4edda; color: #155724; }
+        .badge-warning { background: #fff3cd; color: #856404; }
+        .badge-danger { background: #f8d7da; color: #721c24; }
+        .badge-info { background: #d1ecf1; color: #0c5460; }
+        
+        .section {
+            margin-bottom: 40px;
+        }
+        
+        .section h2 {
+            color: #495057;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }
+        
+        .image-gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        
+        .image-gallery img {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.3s;
+        }
+        
+        .image-gallery img:hover {
+            transform: scale(1.05);
+        }
+        
+        #map {
+            height: 400px;
+            border-radius: 10px;
+            border: 2px solid #e9ecef;
+        }
+        
+        .document-list {
+            display: grid;
+            gap: 15px;
+        }
+        
+        .document-item {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+        
+        .document-item:hover {
+            background: #e9ecef;
+            border-color: #667eea;
+        }
+        
+        .document-icon {
+            font-size: 48px;
+            color: #dc3545;
+        }
+        
+        .document-info {
+            flex: 1;
+        }
+        
+        .document-info h4 {
+            margin-bottom: 5px;
+            color: #212529;
+        }
+        
+        .document-info p {
+            color: #6c757d;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        
+        .document-item a {
+            padding: 10px 20px;
+            background: #667eea;
+            color: white;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: 600;
+            transition: background 0.3s;
+        }
+        
+        .document-item a:hover {
+            background: #764ba2;
+        }
+        
+        .serial-list {
             background: #f8f9fa;
             padding: 15px;
-            border-radius: 5px;
-            margin-top: 10px;
+            border-radius: 8px;
         }
-        .serial-number-item {
-            padding: 8px 12px;
+        
+        .serial-list .serial-item {
+            padding: 10px;
             background: white;
-            margin: 5px 0;
-            border-radius: 4px;
-            border-left: 3px solid #007bff;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            border-left: 3px solid #667eea;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+        }
+        
+        .empty-state i {
+            font-size: 64px;
+            margin-bottom: 15px;
+            opacity: 0.3;
+        }
+        
+        .footer {
+            background: #f8f9fa;
+            padding: 20px;
+            text-align: center;
+            color: #6c757d;
+            font-size: 14px;
+        }
+        
+        @media (max-width: 768px) {
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+            
+            .content {
+                padding: 20px;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="public-header">
-        <h1><i class="fas fa-info-circle"></i> Geräte-Information</h1>
-        <p>Öffentliche Nur-Lese-Ansicht</p>
-        <span class="readonly-badge">
-            <i class="fas fa-eye"></i> Nur ansehen - Keine Bearbeitung möglich
-        </span>
-
-        <div style="margin-top: 15px;">
-            <a href="login.php?redirect=<?= urlencode('view_marker.php?id=' . $marker['id']) ?>" 
-            class="btn btn-primary"
-            style="display: inline-block; background: white; color: #667eea; padding: 12px 25px; border-radius: 25px; text-decoration: none; font-weight: 600; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
-                <i class="fas fa-sign-in-alt"></i> Anmelden für vollständigen Zugriff
-            </a>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1><?= e($marker['name']) ?></h1>
+            <div class="qr-code">QR: <?= e($marker['qr_code']) ?></div>
         </div>
-    </div>
-    
-    <div class="main-container">
-        <div class="content-wrapper">
-            <div class="marker-details">
+        
+        <!-- Content -->
+        <div class="content">
+            <!-- Info-Karten -->
+            <div class="info-grid">
+                <?php if ($marker['category']): ?>
                 <div class="info-card">
-                    <h2><i class="fas fa-box"></i> <?= e($marker['name']) ?></h2>
-                    
-                    <div class="info-grid">
-                        <div class="info-item">
-                            <span class="label">Typ:</span>
-                            <span class="value">
-                                <?php if ($marker['is_multi_device']): ?>
-                                    <span class="badge badge-info">Mehrere Geräte an einem Standort</span>
-                                <?php elseif ($marker['is_storage']): ?>
-                                    <span class="badge badge-info">Lagergerät</span>
-                                <?php else: ?>
-                                    <span class="badge badge-secondary">Betriebsgerät</span>
-                                <?php endif; ?>
-                            </span>
-                        </div>
-                        
-                        <div class="info-item">
-                            <span class="label">Kategorie:</span>
-                            <span class="value"><?= e($marker['category']) ?></span>
-                        </div>
-                        
-                        <?php if (!$marker['is_storage'] && !$marker['is_multi_device']): ?>
-                        <div class="info-item">
-                            <span class="label">Status:</span>
-                            <span class="badge badge-<?= $statusInfo['class'] ?> large">
-                                <?= $statusInfo['label'] ?>
-                            </span>
-                        </div>
-                        <?php endif; ?>
-                        
-                        <?php if ($marker['is_multi_device']): ?>
-                            <div class="info-item" style="grid-column: 1 / -1;">
-                                <span class="label">Seriennummern (<?= count($serialNumbers) ?> Geräte):</span>
-                                <div class="serial-numbers-list">
-                                    <?php if (empty($serialNumbers)): ?>
-                                        <p style="color: #6c757d; margin: 0;">Keine Seriennummern erfasst</p>
-                                    <?php else: ?>
-                                        <?php foreach ($serialNumbers as $index => $sn): ?>
-                                            <div class="serial-number-item">
-                                                <strong><?= $index + 1 ?>.</strong> <?= e($sn['serial_number']) ?>
-                                            </div>
-                                        <?php endforeach; ?>
-                                    <?php endif; ?>
-                                </div>
-                            </div>
-                        <?php elseif ($marker['serial_number']): ?>
-                            <div class="info-item">
-                                <span class="label">Seriennummer:</span>
-                                <span class="value"><?= e($marker['serial_number']) ?></span>
-                            </div>
-                        <?php endif; ?>
-                        
-                        <?php if (!$marker['is_storage'] && !$marker['is_multi_device']): ?>
-                        <div class="info-item">
-                            <span class="label">Betriebsstunden:</span>
-                            <span class="value"><?= e($marker['operating_hours']) ?> h</span>
-                        </div>
-                        
-                        <div class="info-item">
-                            <span class="label">Kraftstofffüllstand:</span>
-                            <div class="fuel-indicator large">
-                                <div class="fuel-bar" style="width: <?= $marker['fuel_level'] ?>%"></div>
-                                <span><?= $marker['fuel_level'] ?>%</span>
-                            </div>
-                        </div>
-                        <?php endif; ?>
-                    </div>
+                    <h3><i class="fas fa-tag"></i> Kategorie</h3>
+                    <div class="value"><?= e($marker['category']) ?></div>
                 </div>
+                <?php endif; ?>
                 
                 <?php if (!$marker['is_storage'] && !$marker['is_multi_device']): ?>
                 <div class="info-card">
-                    <h2><i class="fas fa-wrench"></i> Wartungsinformationen</h2>
-                    <div class="info-grid">
-                        <div class="info-item">
-                            <span class="label">Wartungsintervall:</span>
-                            <span class="value">Alle <?= $marker['maintenance_interval_months'] ?> Monate</span>
-                        </div>
-                        <div class="info-item">
-                            <span class="label">Letzte Wartung:</span>
-                            <span class="value"><?= date('d.m.Y', strtotime($marker['last_maintenance'])) ?></span>
-                        </div>
-                        <div class="info-item">
-                            <span class="label">Nächste Wartung:</span>
-                            <span class="value"><?= date('d.m.Y', strtotime($marker['next_maintenance'])) ?></span>
+                    <h3><i class="fas fa-circle"></i> Status</h3>
+                    <div class="value">
+                        <span class="badge badge-<?= $rentalStatus['class'] ?>">
+                            <?= $rentalStatus['label'] ?>
+                        </span>
+                    </div>
+                </div>
+                <?php endif; ?>
+                
+                <?php if ($marker['serial_number']): ?>
+                <div class="info-card">
+                    <h3><i class="fas fa-barcode"></i> Seriennummer</h3>
+                    <div class="value"><?= e($marker['serial_number']) ?></div>
+                </div>
+                <?php endif; ?>
+                
+                <?php if (!$marker['is_storage'] && !$marker['is_multi_device'] && $marker['next_maintenance']): ?>
+                <div class="info-card">
+                    <h3><i class="fas fa-wrench"></i> Wartung</h3>
+                    <div class="value">
+                        <span class="badge badge-<?= $maintenanceStatus['class'] ?>">
+                            <?= $maintenanceStatus['label'] ?>
+                        </span>
+                        <div style="font-size: 14px; margin-top: 5px; color: #6c757d;">
+                            Nächste: <?= formatDate($marker['next_maintenance']) ?>
                         </div>
                     </div>
                 </div>
                 <?php endif; ?>
                 
+                <?php if ($marker['is_multi_device']): ?>
                 <div class="info-card">
-                    <h2><i class="fas fa-map-marker-alt"></i> Standort</h2>
-                    <div id="markerMap" style="height: 400px; border-radius: 8px; border: 2px solid #dee2e6;"></div>
-                    <p style="margin-top: 10px; color: #6c757d;">
-                        <i class="fas fa-map-pin"></i> 
-                        <?= number_format($marker['latitude'], 6) ?>, <?= number_format($marker['longitude'], 6) ?>
-                    </p>
-                </div>
-                
-                <?php if (!empty($images)): ?>
-                <div class="info-card">
-                    <h2><i class="fas fa-images"></i> Bilder</h2>
-                    <div class="image-gallery">
-                        <?php foreach ($images as $image): ?>
-                            <a href="<?= e($image['image_path']) ?>" target="_blank">
-                                <img src="<?= e($image['image_path']) ?>" alt="Marker Bild">
-                            </a>
-                        <?php endforeach; ?>
+                    <h3><i class="fas fa-layer-group"></i> Typ</h3>
+                    <div class="value">
+                        <span class="badge badge-info">Mehrgerät-Standort</span>
                     </div>
                 </div>
                 <?php endif; ?>
                 
-                <div class="alert alert-info" style="margin-top: 20px;">
-                    <i class="fas fa-info-circle"></i> 
-                    <strong>Hinweis:</strong> Dies ist eine öffentliche Nur-Lese-Ansicht. 
-                    Für vollständigen Zugriff und Bearbeitungsfunktionen melden Sie sich bitte im System an.
+                <?php if ($marker['is_storage']): ?>
+                <div class="info-card">
+                    <h3><i class="fas fa-warehouse"></i> Typ</h3>
+                    <div class="value">
+                        <span class="badge badge-success">Lagergerät</span>
+                    </div>
+                </div>
+                <?php endif; ?>
+            </div>
+            
+            <!-- Multi-Device Seriennummern -->
+            <?php if ($marker['is_multi_device'] && !empty($serialNumbers)): ?>
+            <div class="section">
+                <h2><i class="fas fa-list"></i> Seriennummern an diesem Standort</h2>
+                <div class="serial-list">
+                    <?php foreach ($serialNumbers as $sn): ?>
+                        <div class="serial-item">
+                            <i class="fas fa-barcode"></i> <?= e($sn['serial_number']) ?>
+                        </div>
+                    <?php endforeach; ?>
                 </div>
             </div>
+            <?php endif; ?>
+            
+            <!-- Öffentliche Dokumente -->
+            <?php if (!empty($publicDocuments)): ?>
+            <div class="section">
+                <h2><i class="fas fa-file-pdf"></i> Verfügbare Dokumente</h2>
+                <div class="document-list">
+                    <?php foreach ($publicDocuments as $doc): ?>
+                        <div class="document-item">
+                            <div class="document-icon">
+                                <i class="fas fa-file-pdf"></i>
+                            </div>
+                            <div class="document-info">
+                                <h4><?= e($doc['document_name']) ?></h4>
+                                <?php if ($doc['public_description']): ?>
+                                    <p><?= e($doc['public_description']) ?></p>
+                                <?php endif; ?>
+                                <p>
+                                    <i class="fas fa-clock"></i> <?= formatDateTime($doc['uploaded_at']) ?> | 
+                                    <i class="fas fa-file"></i> <?= number_format($doc['file_size'] / 1024 / 1024, 2) ?> MB
+                                </p>
+                            </div>
+                            <a href="download_public_document.php?id=<?= $doc['id'] ?>&token=<?= urlencode($token) ?>" target="_blank">
+                                <i class="fas fa-download"></i> Herunterladen
+                            </a>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Bilder -->
+            <?php if (!empty($images)): ?>
+            <div class="section">
+                <h2><i class="fas fa-images"></i> Bilder</h2>
+                <div class="image-gallery">
+                    <?php foreach ($images as $image): ?>
+                        <img src="<?= e($image['image_path']) ?>" 
+                             alt="Bild" 
+                             onclick="window.open(this.src, '_blank')">
+                    <?php endforeach; ?>
+                </div>
+            </div>
+            <?php endif; ?>
+            
+            <!-- Karte -->
+            <div class="section">
+                <h2><i class="fas fa-map-marker-alt"></i> Standort</h2>
+                <div id="map"></div>
+                <p style="margin-top: 10px; color: #6c757d; font-size: 14px;">
+                    <i class="fas fa-map-pin"></i> 
+                    <?= number_format($marker['latitude'], 6) ?>, <?= number_format($marker['longitude'], 6) ?>
+                </p>
+            </div>
+        </div>
+        
+        <!-- Footer -->
+        <div class="footer">
+            <p>
+                <i class="fas fa-clock"></i> Erstellt am <?= formatDate($marker['created_at'], 'd.m.Y') ?>
+                <?php if ($marker['created_by_name']): ?>
+                    von <?= e($marker['created_by_name']) ?>
+                <?php endif; ?>
+            </p>
+            <p style="margin-top: 10px; font-size: 12px;">
+                Marker System - Öffentliche Ansicht
+            </p>
         </div>
     </div>
-    <?php include 'footer.php'; ?>
+    
     <script>
-        const map = L.map('markerMap').setView([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>], 15);
+        // Karte initialisieren
+        const map = L.map('map').setView([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>], 15);
         
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors',
-            maxZoom: 19
+            attribution: '© OpenStreetMap contributors'
         }).addTo(map);
         
-        L.marker([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>]).addTo(map)
-            .bindPopup('<strong><?= e($marker['name']) ?></strong>').openPopup();
+        // Marker hinzufügen
+        L.marker([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>])
+            .addTo(map)
+            .bindPopup('<strong><?= addslashes($marker['name']) ?></strong><br><?= addslashes($marker['category'] ?? '') ?>')
+            .openPopup();
     </script>
 </body>
 </html>
