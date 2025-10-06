@@ -3,7 +3,6 @@ require_once 'config.php';
 require_once 'functions.php';
 
 // Kein Login erforderlich - öffentliche Ansicht!
-// Token aus URL holen
 $token = $_GET['token'] ?? '';
 
 if (empty($token)) {
@@ -17,7 +16,7 @@ $stmt = $pdo->prepare("
     FROM markers m
     LEFT JOIN users u ON m.created_by = u.id
     LEFT JOIN categories c ON m.category = c.name
-    WHERE m.public_token = ? AND m.deleted_at IS NULL
+    WHERE m.public_token = ? AND m.deleted_at IS NULL AND m.is_activated = 1
 ");
 $stmt->execute([$token]);
 $marker = $stmt->fetch();
@@ -48,6 +47,9 @@ $publicDocuments = $stmt->fetchAll();
 // Wartungsstatus
 $maintenanceStatus = getMaintenanceStatus($marker['next_maintenance']);
 $rentalStatus = getRentalStatusLabel($marker['rental_status']);
+
+// Mobile Detection
+$isMobile = isMobileDevice();
 ?>
 <!DOCTYPE html>
 <html lang="de">
@@ -56,8 +58,6 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?= e($marker['name']) ?> - Öffentliche Ansicht</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
         * {
             margin: 0;
@@ -66,10 +66,10 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
+            font-family: 'Arial', 'Helvetica', sans-serif;
+            color: var(--text-color);
+            background-color: #f5f5f5;
+            line-height: 1.6;
         }
         
         .container {
@@ -82,58 +82,102 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         }
         
         .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #e63216ff 0%, #9c210eff 100%);
             color: white;
-            padding: 30px;
+            padding: 40px 30px;
             text-align: center;
         }
         
         .header h1 {
             font-size: 32px;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
+            font-weight: 700;
         }
         
         .header .qr-code {
             font-family: 'Courier New', monospace;
-            font-size: 18px;
-            opacity: 0.9;
+            font-size: 20px;
+            opacity: 0.95;
+            background: rgba(255, 255, 255, 0.15);
+            padding: 10px 20px;
+            border-radius: 8px;
+            display: inline-block;
+        }
+        
+        .mobile-login-button {
+            display: none;
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+            width: 60px;
+            height: 60px;
+            background: linear-gradient(135deg, #e63216ff 0%, #9c210eff 100%);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.5);
+            cursor: pointer;
+            font-size: 24px;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .mobile-login-button:active {
+            transform: scale(0.95);
+        }
+        
+        @media (max-width: 768px) {
+            .mobile-login-button {
+                display: flex;
+            }
         }
         
         .content {
-            padding: 30px;
+            padding: 40px 30px;
         }
         
         .info-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             gap: 20px;
-            margin-bottom: 30px;
+            margin-bottom: 40px;
         }
         
         .info-card {
             background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            border-left: 4px solid #667eea;
+            padding: 25px;
+            border-radius: 12px;
+            border-left: 4px solid #e63216ff;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .info-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.2);
         }
         
         .info-card h3 {
-            color: #495057;
-            font-size: 14px;
+            color: #6c757d;
+            font-size: 13px;
             text-transform: uppercase;
             margin-bottom: 10px;
             font-weight: 600;
+            letter-spacing: 0.5px;
         }
         
         .info-card .value {
-            font-size: 20px;
+            font-size: 24px;
             color: #212529;
             font-weight: bold;
         }
         
         .badge {
             display: inline-block;
-            padding: 6px 12px;
+            padding: 8px 16px;
             border-radius: 20px;
             font-size: 14px;
             font-weight: 600;
@@ -150,9 +194,11 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         
         .section h2 {
             color: #495057;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid #e9ecef;
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 3px solid #e9ecef;
+            font-size: 22px;
+            font-weight: 600;
         }
         
         .image-gallery {
@@ -165,19 +211,15 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
             width: 100%;
             height: 200px;
             object-fit: cover;
-            border-radius: 8px;
+            border-radius: 12px;
             cursor: pointer;
-            transition: transform 0.3s;
+            transition: transform 0.3s, box-shadow 0.3s;
+            border: 2px solid #e9ecef;
         }
         
         .image-gallery img:hover {
             transform: scale(1.05);
-        }
-        
-        #map {
-            height: 400px;
-            border-radius: 10px;
-            border: 2px solid #e9ecef;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.2);
         }
         
         .document-list {
@@ -187,11 +229,11 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         
         .document-item {
             background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
+            padding: 25px;
+            border-radius: 12px;
             display: flex;
             align-items: center;
-            gap: 15px;
+            gap: 20px;
             transition: all 0.3s;
             border: 2px solid transparent;
         }
@@ -199,11 +241,14 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         .document-item:hover {
             background: #e9ecef;
             border-color: #667eea;
+            transform: translateX(5px);
         }
         
         .document-icon {
             font-size: 48px;
             color: #dc3545;
+            min-width: 60px;
+            text-align: center;
         }
         
         .document-info {
@@ -211,8 +256,9 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         }
         
         .document-info h4 {
-            margin-bottom: 5px;
+            margin-bottom: 8px;
             color: #212529;
+            font-size: 18px;
         }
         
         .document-info p {
@@ -222,56 +268,79 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
         }
         
         .document-item a {
-            padding: 10px 20px;
-            background: #667eea;
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #e63216ff 0%, #9c210eff 100%);
             color: white;
             text-decoration: none;
-            border-radius: 5px;
+            border-radius: 8px;
             font-weight: 600;
-            transition: background 0.3s;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
         }
         
         .document-item a:hover {
-            background: #764ba2;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
         }
         
         .serial-list {
             background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
+            padding: 20px;
+            border-radius: 12px;
         }
         
-        .serial-list .serial-item {
-            padding: 10px;
+        .serial-item {
+            padding: 15px;
             background: white;
-            margin-bottom: 10px;
-            border-radius: 5px;
-            border-left: 3px solid #667eea;
+            margin-bottom: 12px;
+            border-radius: 8px;
+            border-left: 4px solid #e63216ff;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 16px;
+            font-weight: 600;
+        }
+        
+        .serial-item:last-child {
+            margin-bottom: 0;
         }
         
         .empty-state {
             text-align: center;
-            padding: 40px;
+            padding: 60px 20px;
             color: #6c757d;
         }
         
         .empty-state i {
             font-size: 64px;
-            margin-bottom: 15px;
+            margin-bottom: 20px;
             opacity: 0.3;
         }
         
         .footer {
             background: #f8f9fa;
-            padding: 20px;
+            padding: 30px;
             text-align: center;
             color: #6c757d;
             font-size: 14px;
+            border-top: 1px solid #e9ecef;
+        }
+        
+        .footer p {
+            margin: 8px 0;
         }
         
         @media (max-width: 768px) {
-            .info-grid {
-                grid-template-columns: 1fr;
+            body {
+                padding: 10px;
+            }
+            
+            .header {
+                padding: 30px 20px;
             }
             
             .header h1 {
@@ -279,7 +348,16 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
             }
             
             .content {
-                padding: 20px;
+                padding: 25px 20px;
+            }
+            
+            .info-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .document-item {
+                flex-direction: column;
+                text-align: center;
             }
         }
     </style>
@@ -288,9 +366,16 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
     <div class="container">
         <!-- Header -->
         <div class="header">
-            <h1><?= e($marker['name']) ?></h1>
+            <h1><i class="fas fa-info-circle"></i> <?= e($marker['name']) ?></h1>
             <div class="qr-code">QR: <?= e($marker['qr_code']) ?></div>
         </div>
+        
+        <!-- Mobiler Login-Button -->
+        <?php if ($isMobile): ?>
+        <a href="login.php?redirect=edit_marker.php?id=<?= $marker['id'] ?>" class="mobile-login-button" title="Anmelden & Bearbeiten">
+            <i class="fas fa-sign-in-alt"></i>
+        </a>
+        <?php endif; ?>
         
         <!-- Content -->
         <div class="content">
@@ -317,18 +402,18 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
                 <?php if ($marker['serial_number']): ?>
                 <div class="info-card">
                     <h3><i class="fas fa-barcode"></i> Seriennummer</h3>
-                    <div class="value"><?= e($marker['serial_number']) ?></div>
+                    <div class="value" style="font-family: 'Courier New', monospace;"><?= e($marker['serial_number']) ?></div>
                 </div>
                 <?php endif; ?>
                 
                 <?php if (!$marker['is_storage'] && !$marker['is_multi_device'] && $marker['next_maintenance']): ?>
                 <div class="info-card">
                     <h3><i class="fas fa-wrench"></i> Wartung</h3>
-                    <div class="value">
+                    <div class="value" style="font-size: 16px;">
                         <span class="badge badge-<?= $maintenanceStatus['class'] ?>">
                             <?= $maintenanceStatus['label'] ?>
                         </span>
-                        <div style="font-size: 14px; margin-top: 5px; color: #6c757d;">
+                        <div style="margin-top: 10px; font-size: 14px; color: #6c757d;">
                             Nächste: <?= formatDate($marker['next_maintenance']) ?>
                         </div>
                     </div>
@@ -361,7 +446,8 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
                 <div class="serial-list">
                     <?php foreach ($serialNumbers as $sn): ?>
                         <div class="serial-item">
-                            <i class="fas fa-barcode"></i> <?= e($sn['serial_number']) ?>
+                            <i class="fas fa-barcode" style="font-size: 20px; color: #667eea;"></i> 
+                            <?= e($sn['serial_number']) ?>
                         </div>
                     <?php endforeach; ?>
                 </div>
@@ -381,7 +467,7 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
                             <div class="document-info">
                                 <h4><?= e($doc['document_name']) ?></h4>
                                 <?php if ($doc['public_description']): ?>
-                                    <p><?= e($doc['public_description']) ?></p>
+                                    <p><i class="fas fa-info-circle"></i> <?= e($doc['public_description']) ?></p>
                                 <?php endif; ?>
                                 <p>
                                     <i class="fas fa-clock"></i> <?= formatDateTime($doc['uploaded_at']) ?> | 
@@ -410,45 +496,29 @@ $rentalStatus = getRentalStatusLabel($marker['rental_status']);
                 </div>
             </div>
             <?php endif; ?>
-            
-            <!-- Karte -->
-            <div class="section">
-                <h2><i class="fas fa-map-marker-alt"></i> Standort</h2>
-                <div id="map"></div>
-                <p style="margin-top: 10px; color: #6c757d; font-size: 14px;">
-                    <i class="fas fa-map-pin"></i> 
-                    <?= number_format($marker['latitude'], 6) ?>, <?= number_format($marker['longitude'], 6) ?>
-                </p>
-            </div>
         </div>
         
         <!-- Footer -->
         <div class="footer">
             <p>
-                <i class="fas fa-clock"></i> Erstellt am <?= formatDate($marker['created_at'], 'd.m.Y') ?>
+                <i class="fas fa-calendar"></i> 
+                Erstellt am <?= formatDate($marker['created_at'], 'd.m.Y') ?>
                 <?php if ($marker['created_by_name']): ?>
                     von <?= e($marker['created_by_name']) ?>
                 <?php endif; ?>
             </p>
-            <p style="margin-top: 10px; font-size: 12px;">
-                Marker System - Öffentliche Ansicht
+            <?php if ($isMobile): ?>
+            <p style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #e9ecef;">
+                <i class="fas fa-info-circle"></i> 
+                <a href="login.php?redirect=edit_marker.php?id=<?= $marker['id'] ?>" style="color: #667eea; text-decoration: none; font-weight: 600;">
+                    Anmelden um diesen Marker zu bearbeiten
+                </a>
+            </p>
+            <?php endif; ?>
+            <p style="margin-top: 15px; font-size: 12px; opacity: 0.7;">
+                <i class="fas fa-qrcode"></i> Marker System - Öffentliche Ansicht
             </p>
         </div>
     </div>
-    
-    <script>
-        // Karte initialisieren
-        const map = L.map('map').setView([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>], 15);
-        
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors'
-        }).addTo(map);
-        
-        // Marker hinzufügen
-        L.marker([<?= $marker['latitude'] ?>, <?= $marker['longitude'] ?>])
-            .addTo(map)
-            .bindPopup('<strong><?= addslashes($marker['name']) ?></strong><br><?= addslashes($marker['category'] ?? '') ?>')
-            .openPopup();
-    </script>
 </body>
 </html>

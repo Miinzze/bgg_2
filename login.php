@@ -212,12 +212,6 @@ function createRememberToken($userId, $pdo) {
     setcookie('remember_token', $token, time() + (30 * 24 * 60 * 60), '/', '', false, true);
 }
 
-// Neueste Patchnote
-$latestPatchnote = null;
-try {
-    $stmt = $pdo->query("SELECT * FROM patchnotes WHERE is_active = 1 ORDER BY release_date DESC LIMIT 1");
-    $latestPatchnote = $stmt->fetch();
-} catch (PDOException $e) {}
 ?>
 <!DOCTYPE html>
 <html lang="de">
@@ -228,54 +222,6 @@ try {
     <link rel="stylesheet" href="css/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
         <style>
-        .patchnote-box {
-            margin-top: 20px;
-            padding: 15px;
-            background: #f8f9fa;
-            border-left: 4px solid #007bff;
-            border-radius: 4px;
-        }
-        .patchnote-box h4 {
-            margin: 0 0 10px 0;
-            color: #007bff;
-            font-size: 14px;
-        }
-        .patchnote-box .version {
-            display: inline-block;
-            background: #007bff;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 3px;
-            font-size: 11px;
-            font-weight: bold;
-            margin-right: 8px;
-        }
-        .patchnote-box p {
-            margin: 10px 0;
-            font-size: 13px;
-            line-height: 1.5;
-            white-space: pre-line;
-        }
-        .patchnote-box .patchnote-footer {
-            margin-top: 10px;
-            padding-top: 10px;
-            border-top: 1px solid #dee2e6;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 12px;
-        }
-        .patchnote-box .release-date {
-            color: #6c757d;
-        }
-        .patchnote-box a {
-            color: #007bff;
-            text-decoration: none;
-            font-weight: 500;
-        }
-        .patchnote-box a:hover {
-            text-decoration: underline;
-        }
         .fa-2-code {
             font-size: 48px;
             text-align: center;
@@ -365,26 +311,6 @@ try {
                         <i class="fas fa-sign-in-alt"></i> Anmelden
                     </button>
                 </form>
-            <?php endif; ?>
-            
-            <?php if ($latestPatchnote && !$show2FA): ?>
-            <div class="patchnote-box">
-                <h4>
-                    <i class="fas fa-rocket"></i> Was ist neu?
-                    <span class="version">v<?= htmlspecialchars($latestPatchnote['version']) ?></span>
-                    <?= htmlspecialchars($latestPatchnote['title']) ?>
-                </h4>
-                <p><?= htmlspecialchars($latestPatchnote['description']) ?></p>
-                <div class="patchnote-footer">
-                    <span class="release-date">
-                        <i class="fas fa-calendar"></i> 
-                        <?= date('d.m.Y', strtotime($latestPatchnote['release_date'])) ?>
-                    </span>
-                    <a href="patchnotes.php">
-                        <i class="fas fa-list"></i> Alle Updates anzeigen
-                    </a>
-                </div>
-            </div>
             <?php endif; ?>
         </div>
     </div>

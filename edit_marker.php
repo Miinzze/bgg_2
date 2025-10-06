@@ -13,7 +13,6 @@ if (!$marker) {
 $message = '';
 $messageType = '';
 
-// Formular verarbeiten
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     validateCSRF();
     
@@ -25,20 +24,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $maintenanceInterval = $_POST['maintenance_interval'] ?? 6;
     $lastMaintenance = $_POST['last_maintenance'] ?? null;
     
+    // GPS-Position
+    $latitude = $_POST['latitude'] ?? $marker['latitude'];
+    $longitude = $_POST['longitude'] ?? $marker['longitude'];
+    $updateGPS = isset($_POST['update_gps']) && $_POST['update_gps'] == '1';
+    
     if (empty($name)) {
         $message = 'Name ist erforderlich';
+        $messageType = 'danger';
+    } elseif (!validateSerialNumber($serialNumber)) {
+        $message = 'Seriennummer darf nur Zahlen enthalten';
+        $messageType = 'danger';
+    } elseif ($updateGPS && !validateCoordinates($latitude, $longitude)) {
+        $message = 'Ungültige GPS-Koordinaten';
         $messageType = 'danger';
     } else {
         try {
             $pdo->beginTransaction();
             
-            // Nächste Wartung berechnen
             $nextMaintenance = null;
             if (!$marker['is_storage'] && !$marker['is_multi_device'] && $lastMaintenance && $maintenanceInterval > 0) {
                 $nextMaintenance = calculateNextMaintenance($lastMaintenance, $maintenanceInterval);
             }
             
-            // Marker aktualisieren
+            // Wenn GPS aktualisiert wird und Marker noch nicht aktiviert war -> aktivieren
+            $isActivated = $marker['is_activated'];
+            if ($updateGPS && $latitude && $longitude) {
+                $isActivated = 1;
+            }
+            
             $stmt = $pdo->prepare("
                 UPDATE markers SET
                     name = ?,
@@ -48,7 +62,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     fuel_level = ?,
                     maintenance_interval_months = ?,
                     last_maintenance = ?,
-                    next_maintenance = ?
+                    next_maintenance = ?,
+                    latitude = ?,
+                    longitude = ?,
+                    is_activated = ?
                 WHERE id = ?
             ");
             
@@ -61,10 +78,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 intval($maintenanceInterval),
                 $lastMaintenance,
                 $nextMaintenance,
+                $latitude,
+                $longitude,
+                $isActivated,
                 $id
             ]);
             
-            // Custom Fields aktualisieren
+            // Custom Fields
             if (!empty($_POST['custom_fields'])) {
                 foreach ($_POST['custom_fields'] as $fieldId => $value) {
                     $stmt = $pdo->prepare("
@@ -76,13 +96,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             
-            // Öffentliche Dokumente aktualisieren
+            // Öffentliche Dokumente
             if (hasPermission('documents_upload')) {
-                // Erst alle auf privat setzen
                 $stmt = $pdo->prepare("UPDATE marker_documents SET is_public = 0 WHERE marker_id = ?");
                 $stmt->execute([$id]);
                 
-                // Dann die ausgewählten auf öffentlich setzen
                 if (!empty($_POST['public_docs'])) {
                     foreach ($_POST['public_docs'] as $docId => $value) {
                         $description = $_POST['public_descriptions'][$docId] ?? null;
@@ -97,7 +115,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             
-            // Neue Bilder hochladen
+            // Neue Bilder
             if (!empty($_FILES['images']['name'][0])) {
                 foreach ($_FILES['images']['tmp_name'] as $key => $tmpName) {
                     if (!empty($tmpName)) {
@@ -117,7 +135,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             }
             
-            // Neue Dokumente hochladen
+            // Neue Dokumente
             if (hasPermission('documents_upload') && !empty($_FILES['documents']['name'][0])) {
                 foreach ($_FILES['documents']['tmp_name'] as $key => $tmpName) {
                     if (!empty($tmpName)) {
@@ -156,10 +174,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             logActivity('marker_updated', "Marker '{$name}' aktualisiert", $id);
             
-            $message = 'Marker erfolgreich aktualisiert!';
+            if ($updateGPS && !$marker['is_activated'] && $isActivated) {
+                $message = 'Marker erfolgreich aktualisiert und aktiviert!';
+            } else {
+                $message = 'Marker erfolgreich aktualisiert!';
+            }
             $messageType = 'success';
             
-            // Marker neu laden
             $marker = getMarkerById($id, $pdo);
             
         } catch (Exception $e) {
@@ -170,7 +191,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Bilder, Dokumente und Custom Fields laden
 $images = getMarkerImages($id, $pdo);
 
 $stmt = $pdo->prepare("SELECT * FROM marker_documents WHERE marker_id = ? ORDER BY uploaded_at DESC");
@@ -184,6 +204,8 @@ if (!empty($customFields)) {
     $stmt->execute([$id]);
     $customValues = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
 }
+
+$settings = getSystemSettings();
 ?>
 <!DOCTYPE html>
 <html lang="de">
@@ -192,9 +214,33 @@ if (!empty($customFields)) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Marker bearbeiten - <?= e($marker['name']) ?></title>
     <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/dark-mode.css">
+    <link rel="stylesheet" href="css/mobile-features.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
+        .qr-code-display {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            text-align: center;
+        }
+        
+        .qr-code-display code {
+            font-size: 24px;
+            font-weight: bold;
+            padding: 10px 20px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 8px;
+            display: inline-block;
+            margin: 10px 0;
+        }
+        
         .document-item {
-            background: #f8f9fa;
+            background: var(--bg-secondary);
             padding: 15px;
             margin-bottom: 10px;
             border-radius: 8px;
@@ -206,29 +252,64 @@ if (!empty($customFields)) {
             background: #d4edda;
         }
         
+        body.dark-mode .document-item.public {
+            background: #1a4d2e;
+        }
+        
         .public-toggle {
             margin: 10px 0;
             padding: 10px;
-            background: white;
+            background: var(--card-bg);
             border-radius: 5px;
         }
         
-        .public-description {
-            margin-top: 10px;
+        .image-item {
+            position: relative;
+            display: inline-block;
         }
         
-        .qr-code-display {
-            background: #e3f2fd;
-            padding: 15px;
+        .image-item img {
+            width: 150px;
+            height: 150px;
+            object-fit: cover;
             border-radius: 8px;
-            border-left: 4px solid #2196f3;
-            margin-bottom: 20px;
+            border: 2px solid var(--border-color);
         }
         
-        .qr-code-display code {
-            font-size: 18px;
-            font-weight: bold;
-            color: #1976d2;
+        .image-item .btn {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+        }
+        
+        .gps-section {
+            background: var(--bg-secondary);
+            padding: 20px;
+            border-radius: 10px;
+            margin-top: 15px;
+        }
+        
+        .gps-info {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .gps-coordinates {
+            font-family: 'Courier New', monospace;
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-color);
+        }
+        
+        #editMap {
+            height: 400px;
+            border-radius: 8px;
+            border: 2px solid var(--border-color);
+            margin-top: 15px;
         }
     </style>
 </head>
@@ -246,23 +327,25 @@ if (!empty($customFields)) {
                 <div class="alert alert-<?= $messageType ?>"><?= e($message) ?></div>
             <?php endif; ?>
             
-            <!-- QR-Code Anzeige (nicht änderbar) -->
             <div class="qr-code-display">
-                <strong><i class="fas fa-qrcode"></i> QR-Code:</strong>
+                <div><i class="fas fa-qrcode" style="font-size: 36px;"></i></div>
+                <strong>QR-Code:</strong>
                 <code><?= e($marker['qr_code']) ?></code>
-                <span style="color: #666; margin-left: 15px;">
-                    <i class="fas fa-info-circle"></i> QR-Codes können nicht geändert werden
-                </span>
-                <a href="print_qr.php?id=<?= $marker['id'] ?>" class="btn btn-sm btn-secondary" target="_blank" style="float: right;">
-                    <i class="fas fa-print"></i> QR-Code drucken
-                </a>
+                <div style="margin-top: 15px;">
+                    <span style="opacity: 0.9;">
+                        <i class="fas fa-info-circle"></i> QR-Codes können nicht geändert werden
+                    </span>
+                    <a href="print_qr.php?id=<?= $marker['id'] ?>" class="btn btn-light btn-sm" target="_blank" style="margin-left: 15px;">
+                        <i class="fas fa-print"></i> QR-Code drucken
+                    </a>
+                </div>
             </div>
             
             <form method="POST" enctype="multipart/form-data" class="marker-form">
                 <?= csrf_field() ?>
                 
                 <div class="form-section">
-                    <h2>Grunddaten</h2>
+                    <h2><i class="fas fa-info-circle"></i> Grunddaten</h2>
                     
                     <div class="form-group">
                         <label for="name">Name *</label>
@@ -284,14 +367,84 @@ if (!empty($customFields)) {
                     </div>
                 </div>
                 
+                <!-- GPS-Position Section -->
+                <div class="form-section">
+                    <h2><i class="fas fa-map-marker-alt"></i> GPS-Position</h2>
+                    
+                    <?php if ($marker['is_activated'] && $marker['latitude'] && $marker['longitude']): ?>
+                        <div class="alert alert-info">
+                            <strong><i class="fas fa-check-circle"></i> Aktuelle Position:</strong>
+                            <div class="gps-coordinates">
+                                <i class="fas fa-map-pin"></i> 
+                                <?= number_format($marker['latitude'], 6) ?>, <?= number_format($marker['longitude'], 6) ?>
+                            </div>
+                        </div>
+                    <?php else: ?>
+                        <div class="alert alert-warning">
+                            <strong><i class="fas fa-exclamation-triangle"></i> Marker nicht aktiviert</strong>
+                            <p>Dieser Marker hat noch keine GPS-Position. Erfassen Sie die Position vor Ort!</p>
+                        </div>
+                    <?php endif; ?>
+                    
+                    <div class="gps-section">
+                        <div class="gps-info">
+                            <div>
+                                <h3 style="margin: 0 0 10px 0;"><i class="fas fa-crosshairs"></i> Position aktualisieren</h3>
+                                <p style="color: var(--text-secondary); margin: 0;">
+                                    Ändern Sie die Position, wenn das Gerät umgestellt wurde.
+                                </p>
+                            </div>
+                            <button type="button" class="gps-button" onclick="captureGPS()">
+                                <i class="fas fa-satellite-dish"></i> GPS erfassen
+                            </button>
+                        </div>
+                        
+                        <div class="form-row" style="margin-top: 15px;">
+                            <div class="form-group">
+                                <label for="latitude">Breitengrad</label>
+                                <input type="number" id="latitude" name="latitude" 
+                                       value="<?= $marker['latitude'] ?>" 
+                                       step="0.000001" 
+                                       placeholder="z.B. 49.995567"
+                                       readonly>
+                            </div>
+                            
+                            <div class="form-group">
+                                <label for="longitude">Längengrad</label>
+                                <input type="number" id="longitude" name="longitude" 
+                                       value="<?= $marker['longitude'] ?>" 
+                                       step="0.000001" 
+                                       placeholder="z.B. 9.073127"
+                                       readonly>
+                            </div>
+                        </div>
+                        
+                        <input type="hidden" id="update_gps" name="update_gps" value="0">
+                        
+                        <div id="gps-status" class="gps-status"></div>
+                        
+                        <!-- Karte zur Positionsauswahl -->
+                        <div id="editMap"></div>
+                        
+                        <small style="color: var(--text-secondary); margin-top: 10px; display: block;">
+                            <i class="fas fa-info-circle"></i> Klicken Sie auf die Karte oder nutzen Sie GPS, um die Position zu setzen
+                        </small>
+                    </div>
+                </div>
+                
                 <?php if (!$marker['is_multi_device'] && !$marker['is_storage']): ?>
                 <div class="form-section">
-                    <h2>Gerätedaten</h2>
+                    <h2><i class="fas fa-cog"></i> Gerätedaten</h2>
                     
                     <div class="form-group">
                         <label for="serial_number">Seriennummer</label>
                         <input type="text" id="serial_number" name="serial_number" 
-                               value="<?= e($marker['serial_number']) ?>">
+                               value="<?= e($marker['serial_number']) ?>"
+                               pattern="[0-9]+" 
+                               inputmode="numeric"
+                               title="Bitte nur Zahlen eingeben"
+                               placeholder="Nur Zahlen erlaubt">
+                        <small>Nur Zahlen erlaubt</small>
                     </div>
                     
                     <div class="form-row">
@@ -314,7 +467,7 @@ if (!empty($customFields)) {
                 </div>
                 
                 <div class="form-section">
-                    <h2>Wartung</h2>
+                    <h2><i class="fas fa-wrench"></i> Wartung</h2>
                     
                     <div class="form-row">
                         <div class="form-group">
@@ -346,9 +499,7 @@ if (!empty($customFields)) {
                                 <?php endif; ?>
                             </label>
                             
-                            <?php
-                            $value = $customValues[$field['id']] ?? '';
-                            ?>
+                            <?php $value = $customValues[$field['id']] ?? ''; ?>
                             
                             <?php if ($field['field_type'] === 'textarea'): ?>
                                 <textarea id="custom_<?= $field['id'] ?>" 
@@ -406,34 +557,32 @@ if (!empty($customFields)) {
                                             <i class="fas fa-eye"></i> Anzeigen
                                         </a>
                                         <button type="button" onclick="deleteDocument(<?= $doc['id'] ?>)" class="btn btn-sm btn-danger">
-                                            <i class="fas fa-trash"></i> Löschen
+                                            <i class="fas fa-trash"></i>
                                         </button>
                                     </div>
                                 </div>
                                 
-                                <!-- ÖFFENTLICH-TOGGLE -->
                                 <div class="public-toggle">
-                                    <input type="checkbox" 
-                                           id="public_<?= $doc['id'] ?>" 
-                                           name="public_docs[<?= $doc['id'] ?>]"
-                                           value="1"
-                                           <?= $doc['is_public'] ? 'checked' : '' ?>
-                                           onchange="togglePublicDescription(<?= $doc['id'] ?>)">
-                                    <label for="public_<?= $doc['id'] ?>">
+                                    <label>
+                                        <input type="checkbox" 
+                                               id="public_<?= $doc['id'] ?>" 
+                                               name="public_docs[<?= $doc['id'] ?>]"
+                                               value="1"
+                                               <?= $doc['is_public'] ? 'checked' : '' ?>
+                                               onchange="togglePublicDescription(<?= $doc['id'] ?>)">
                                         <i class="fas fa-globe"></i> <strong>Öffentlich sichtbar</strong>
-                                        <small>(erscheint in Public View ohne Login)</small>
+                                        <small>(erscheint in Public View)</small>
                                     </label>
                                     
                                     <div id="public_desc_<?= $doc['id'] ?>" 
-                                         class="public-description"
-                                         style="display: <?= $doc['is_public'] ? 'block' : 'none' ?>;">
-                                        <label for="desc_<?= $doc['id'] ?>">Öffentliche Beschreibung (optional):</label>
+                                         style="display: <?= $doc['is_public'] ? 'block' : 'none' ?>; margin-top: 10px;">
+                                        <label for="desc_<?= $doc['id'] ?>">Öffentliche Beschreibung:</label>
                                         <input type="text" 
                                                id="desc_<?= $doc['id'] ?>"
                                                name="public_descriptions[<?= $doc['id'] ?>]"
-                                               placeholder="z.B. Bedienungsanleitung Generator XY123"
+                                               placeholder="z.B. Bedienungsanleitung"
                                                value="<?= e($doc['public_description'] ?? '') ?>"
-                                               style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ddd;">
+                                               style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid var(--border-color);">
                                     </div>
                                 </div>
                             </div>
@@ -442,21 +591,8 @@ if (!empty($customFields)) {
                     
                     <h3 style="margin-top: 30px;">Neue Dokumente hochladen</h3>
                     <div class="form-group">
-                        <input type="file" id="documents" name="documents[]" multiple accept=".pdf,application/pdf">
-                        <small>Nur PDF-Dateien (max. 10MB pro Datei)</small>
-                    </div>
-                    
-                    <div id="newDocOptions" style="display: none; margin-top: 10px; padding: 15px; background: #f8f9fa; border-radius: 8px;">
-                        <div style="margin-bottom: 10px;">
-                            <input type="checkbox" id="new_doc_public" name="new_doc_is_public[0]" value="1">
-                            <label for="new_doc_public">
-                                <i class="fas fa-globe"></i> Als öffentlich markieren
-                            </label>
-                        </div>
-                        <input type="text" 
-                               name="new_doc_public_desc[0]" 
-                               placeholder="Öffentliche Beschreibung (optional)"
-                               style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ddd;">
+                        <input type="file" id="documents" name="documents[]" multiple accept=".pdf">
+                        <small>Nur PDF-Dateien (max. 10MB)</small>
                     </div>
                 </div>
                 <?php endif; ?>
@@ -466,19 +602,19 @@ if (!empty($customFields)) {
                     <h2><i class="fas fa-images"></i> Bilder</h2>
                     
                     <?php if (!empty($images)): ?>
-                        <div class="image-gallery">
+                        <div class="image-gallery" style="margin-bottom: 20px;">
                             <?php foreach ($images as $img): ?>
                                 <div class="image-item">
                                     <img src="<?= e($img['image_path']) ?>" alt="Bild">
                                     <button type="button" onclick="deleteImage(<?= $img['id'] ?>)" class="btn btn-sm btn-danger">
-                                        <i class="fas fa-trash"></i> Löschen
+                                        <i class="fas fa-trash"></i>
                                     </button>
                                 </div>
                             <?php endforeach; ?>
                         </div>
                     <?php endif; ?>
                     
-                    <div class="form-group" style="margin-top: 20px;">
+                    <div class="form-group">
                         <label for="images">Neue Bilder hochladen</label>
                         <input type="file" id="images" name="images[]" multiple accept="image/*">
                     </div>
@@ -498,7 +634,83 @@ if (!empty($customFields)) {
     
     <?php include 'footer.php'; ?>
     
+    <script src="js/gps-helper.js"></script>
+    
     <script>
+        // Karte initialisieren
+        const currentLat = <?= $marker['latitude'] ?: $settings['map_default_lat'] ?>;
+        const currentLng = <?= $marker['longitude'] ?: $settings['map_default_lng'] ?>;
+        
+        const editMap = L.map('editMap').setView([currentLat, currentLng], 16);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(editMap);
+        
+        let marker = L.marker([currentLat, currentLng], { draggable: true }).addTo(editMap);
+        
+        // Marker-Position bei Drag aktualisieren
+        marker.on('dragend', function(e) {
+            const pos = e.target.getLatLng();
+            document.getElementById('latitude').value = pos.lat.toFixed(6);
+            document.getElementById('longitude').value = pos.lng.toFixed(6);
+            document.getElementById('update_gps').value = '1';
+        });
+        
+        // Bei Klick auf Karte Marker verschieben
+        editMap.on('click', function(e) {
+            marker.setLatLng(e.latlng);
+            document.getElementById('latitude').value = e.latlng.lat.toFixed(6);
+            document.getElementById('longitude').value = e.latlng.lng.toFixed(6);
+            document.getElementById('update_gps').value = '1';
+        });
+        
+        // GPS-Erfassung
+        function captureGPS() {
+            const gpsHelper = new GPSHelper();
+            const button = document.querySelector('.gps-button');
+            const statusDiv = document.getElementById('gps-status');
+            
+            button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Erfasse Position...';
+            button.disabled = true;
+            
+            gpsHelper.getCurrentPosition(
+                (position) => {
+                    document.getElementById('latitude').value = position.lat.toFixed(6);
+                    document.getElementById('longitude').value = position.lng.toFixed(6);
+                    document.getElementById('update_gps').value = '1';
+                    
+                    marker.setLatLng([position.lat, position.lng]);
+                    editMap.setView([position.lat, position.lng], 16);
+                    
+                    statusDiv.innerHTML = `
+                        <div style="padding: 10px; background: #d4edda; border-left: 4px solid #28a745; border-radius: 5px; margin: 10px 0; color: #155724;">
+                            <i class="fas fa-check-circle"></i> GPS-Position erfasst!
+                            <br><small>Genauigkeit: ${position.accuracy.toFixed(0)}m</small>
+                        </div>
+                    `;
+                    
+                    button.innerHTML = '<i class="fas fa-check"></i> Position erfasst';
+                    button.style.background = '#28a745';
+                    
+                    setTimeout(() => {
+                        button.innerHTML = '<i class="fas fa-satellite-dish"></i> GPS erfassen';
+                        button.style.background = '';
+                        button.disabled = false;
+                    }, 2000);
+                },
+                (error) => {
+                    statusDiv.innerHTML = `
+                        <div style="padding: 10px; background: #f8d7da; border-left: 4px solid #dc3545; border-radius: 5px; margin: 10px 0; color: #721c24;">
+                            <i class="fas fa-exclamation-circle"></i> ${error}
+                        </div>
+                    `;
+                    button.innerHTML = '<i class="fas fa-satellite-dish"></i> GPS erfassen';
+                    button.disabled = false;
+                }
+            );
+        }
+        
         function togglePublicDescription(docId) {
             const checkbox = document.getElementById('public_' + docId);
             const descDiv = document.getElementById('public_desc_' + docId);
@@ -516,12 +728,8 @@ if (!empty($customFields)) {
                 window.location.href = 'delete_document.php?id=' + docId + '&marker_id=<?= $marker['id'] ?>';
             }
         }
-        
-        // Neue Dokumente: Öffentlich-Optionen anzeigen
-        document.getElementById('documents').addEventListener('change', function(e) {
-            const optionsDiv = document.getElementById('newDocOptions');
-            optionsDiv.style.display = e.target.files.length > 0 ? 'block' : 'none';
-        });
     </script>
+    
+    <script src="js/dark-mode.js"></script>
 </body>
 </html>

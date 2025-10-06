@@ -15,13 +15,13 @@ $isMobile = isMobileDevice();
                 <li><a href="index.php">Übersicht</a></li>
                 <li><a href="advanced_search.php">Erweiterte Suche</a></li>
                 <?php if (hasPermission('markers_create')): ?>
-                    <li class="mobile-only-nav"><a href="scan.php">RFID Scannen</a></li>
+                    <li class="mobile-only-nav"><a href="scan.php">QR-Code Scannen</a></li>
                     
                     <?php if (!$isMobile): ?>
                         <li><a href="create_marker.php">Marker erstellen</a></li>
                     <?php endif; ?>
                     
-                    <li class="mobile-only-nav"><a href="rescan.php">Erneut Scannen</a></li>
+                    <li><a href="inactive_markers.php">Zu aktivieren</a></li>
                 <?php endif; ?>
                 
                 <?php if (hasPermission('markers_delete')): ?>

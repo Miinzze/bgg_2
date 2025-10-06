@@ -3,21 +3,26 @@ require_once 'config.php';
 require_once 'functions.php';
 requireLogin();
 
-// Statistiken laden
+// Statistiken laden - NUR AKTIVIERTE MARKER
 try {
-    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 1");
+    // LagergerĂ€te (aktiviert)
+    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 1 AND is_activated = 1 AND deleted_at IS NULL");
     $storageCount = $stmt->fetchColumn();
     
-    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 0 AND rental_status = 'verfuegbar'");
+    // VerfĂ¼gbare MietgerĂ€te (aktiviert)
+    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 0 AND rental_status = 'verfuegbar' AND is_activated = 1 AND deleted_at IS NULL");
     $availableCount = $stmt->fetchColumn();
     
-    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 0 AND rental_status = 'vermietet'");
+    // Vermietete GerĂ€te (aktiviert)
+    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_storage = 0 AND rental_status = 'vermietet' AND is_activated = 1 AND deleted_at IS NULL");
     $rentedCount = $stmt->fetchColumn();
     
-    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE next_maintenance <= CURDATE() AND next_maintenance IS NOT NULL");
+    // FĂ€llige Wartungen (aktiviert)
+    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE next_maintenance <= CURDATE() AND next_maintenance IS NOT NULL AND is_activated = 1 AND deleted_at IS NULL");
     $maintenanceDueCount = $stmt->fetchColumn();
     
-    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE next_maintenance BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)");
+    // Wartungen diese Woche (aktiviert)
+    $stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE next_maintenance BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY) AND is_activated = 1 AND deleted_at IS NULL");
     $maintenanceThisWeek = $stmt->fetchColumn();
     
     $totalRentalDevices = $availableCount + $rentedCount;
@@ -33,8 +38,13 @@ try {
     $utilizationRate = 0;
 }
 
-$stmt = $pdo->query("SELECT * FROM markers ORDER BY created_at DESC");
+// NUR AKTIVIERTE UND NICHT GELÖSCHTE MARKER LADEN
+$stmt = $pdo->query("SELECT * FROM markers WHERE is_activated = 1 AND deleted_at IS NULL ORDER BY created_at DESC");
 $markers = $stmt->fetchAll();
+
+// Nicht-aktivierte Marker zÀhlen (fßr Info)
+$stmt = $pdo->query("SELECT COUNT(*) FROM markers WHERE is_activated = 0 AND deleted_at IS NULL");
+$inactiveCount = $stmt->fetchColumn();
 
 $settings = getSystemSettings();
 $showLegend = !empty($settings['show_map_legend']);
@@ -57,8 +67,11 @@ $showMessages = !empty($settings['show_system_messages']);
     <div class="map-dashboard-container">
         <?php if ($showMessages): ?>
         <div class="system-message" style="position: absolute; top: 20px; left: 50%; transform: translateX(-50%); z-index: 1001; background: white; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 500px;">
-            <strong>System bereit</strong> - <?= count($markers) ?> Marker erfasst
-            <button onclick="this.parentElement.style.display='none'" style="float: right; border: none; background: none; cursor: pointer; font-size: 18px;">×</button>
+            <strong>System bereit</strong> - <?= count($markers) ?> aktive Marker auf Karte
+            <?php if ($inactiveCount > 0): ?>
+                <br><small style="color: #666;"><?= $inactiveCount ?> Marker warten auf Aktivierung (QR-Code scannen)</small>
+            <?php endif; ?>
+            <button onclick="this.parentElement.style.display='none'" style="float: right; border: none; background: none; cursor: pointer; font-size: 18px;">Ă—</button>
         </div>
         <?php endif; ?>
         
@@ -71,8 +84,7 @@ $showMessages = !empty($settings['show_system_messages']);
         </div>
         
         <div class="map-container" id="mapContainer">
-            <div id="map">
-        </div>
+            <div id="map"></div>
             
         <?php if ($showLegend): ?>
         <!-- Legende - nur auf Desktop -->
@@ -80,7 +92,7 @@ $showMessages = !empty($settings['show_system_messages']);
             <h4>Legende</h4>
             <div class="legend-item">
                 <div class="legend-color" style="background-color: #3388ff;"></div>
-                <span>Verfügbar</span>
+                <span>VerfĂ¼gbar</span>
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background-color: #ffc107;"></div>
@@ -96,7 +108,7 @@ $showMessages = !empty($settings['show_system_messages']);
             </div>
             <div class="legend-item">
                 <div class="legend-color" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);"></div>
-                <span>Mehrgerät</span>
+                <span>MehrgerĂ€t</span>
             </div>
         </div>
         <?php endif; ?>
@@ -118,12 +130,12 @@ $showMessages = !empty($settings['show_system_messages']);
             
             <div class="dashboard-content">
                 <div class="dashboard-section">
-                    <h3>Übersicht</h3>
+                    <h3>Ăœbersicht</h3>
                     
                     <div class="stat-card success">
                         <div class="stat-label">
                             <i class="fas fa-warehouse"></i>
-                            Lagergeräte Gesamt
+                            LagergerĂ€te Gesamt
                         </div>
                         <div class="stat-value"><?= $storageCount ?></div>
                     </div>
@@ -131,7 +143,7 @@ $showMessages = !empty($settings['show_system_messages']);
                     <div class="stat-card">
                         <div class="stat-label">
                             <i class="fas fa-check-circle"></i>
-                            Verfügbare Mietgeräte
+                            VerfĂ¼gbare MietgerĂ€te
                         </div>
                         <div class="stat-value"><?= $availableCount ?></div>
                     </div>
@@ -139,7 +151,7 @@ $showMessages = !empty($settings['show_system_messages']);
                     <div class="stat-card warning">
                         <div class="stat-label">
                             <i class="fas fa-handshake"></i>
-                            Vermietete Geräte
+                            Vermietete GerĂ€te
                         </div>
                         <div class="stat-value"><?= $rentedCount ?></div>
                     </div>
@@ -147,10 +159,21 @@ $showMessages = !empty($settings['show_system_messages']);
                     <div class="stat-card <?= $maintenanceDueCount > 0 ? 'danger' : '' ?>">
                         <div class="stat-label">
                             <i class="fas fa-wrench"></i>
-                            Fällige Wartungen
+                            FÀllige Wartungen
                         </div>
                         <div class="stat-value"><?= $maintenanceDueCount ?></div>
                     </div>
+                    
+                    <?php if ($inactiveCount > 0): ?>
+                    <div class="stat-card" style="background: #f8f9fa; border-left: 4px solid #6c757d;">
+                        <div class="stat-label">
+                            <i class="fas fa-qrcode"></i>
+                            Warten auf Aktivierung
+                        </div>
+                        <div class="stat-value"><?= $inactiveCount ?></div>
+                        <small style="color: #666; font-size: 0.8em;">QR-Codes noch nicht gescannt</small>
+                    </div>
+                    <?php endif; ?>
                 </div>
                 
                 <div class="dashboard-section">
@@ -195,6 +218,7 @@ $showMessages = !empty($settings['show_system_messages']);
             return;
         }
         
+        // NUR IN AKTIVIERTEN MARKERN SUCHEN
         const results = allMarkers.filter(marker => {
             const name = (marker.name || '').toLowerCase();
             const serial = (marker.serial_number || '').toLowerCase();
@@ -214,7 +238,7 @@ $showMessages = !empty($settings['show_system_messages']);
         const resultsDiv = document.getElementById('searchResults');
         
         if (results.length === 0) {
-            resultsDiv.innerHTML = '<div class="no-results">Keine Marker gefunden</div>';
+            resultsDiv.innerHTML = '<div class="no-results">Keine aktiven Marker gefunden</div>';
             resultsDiv.classList.add('active');
             return;
         }
@@ -222,7 +246,7 @@ $showMessages = !empty($settings['show_system_messages']);
         let html = '';
         results.forEach(marker => {
             const statusText = {
-                'verfuegbar': 'Verfügbar',
+                'verfuegbar': 'VerfĂ¼gbar',
                 'vermietet': 'Vermietet',
                 'wartung': 'In Wartung'
             }[marker.rental_status] || marker.rental_status;
@@ -295,7 +319,7 @@ $showMessages = !empty($settings['show_system_messages']);
     }
     
     function scanToEdit(markerId) {
-        alert('Bitte scannen Sie den RFID-Chip des Markers, um ihn zu bearbeiten.');
+        alert('Bitte scannen Sie den QR-Code des Markers, um ihn zu bearbeiten.');
         window.location.href = 'scan.php?edit=' + markerId;
     }
     
@@ -329,12 +353,13 @@ $showMessages = !empty($settings['show_system_messages']);
     }
     
     // Standard Leaflet Icons in verschiedenen Farben
-    const blueIcon = getColoredIcon('blue');      // Verfügbar
+    const blueIcon = getColoredIcon('blue');      // VerfĂ¼gbar
     const goldIcon = getColoredIcon('gold');      // Vermietet
     const redIcon = getColoredIcon('red');        // Wartung
     const greenIcon = getColoredIcon('green');    // Lager
     const violetIcon = getColoredIcon('violet');  // Multi-Device
     
+    // NUR AKTIVIERTE MARKER AUF KARTE ANZEIGEN
     markers.forEach(marker => {
         let icon = blueIcon; // Default
         
@@ -364,11 +389,11 @@ $showMessages = !empty($settings['show_system_messages']);
     });
     
     function getStatusText(marker) {
-        if (marker.is_multi_device) return 'Mehrgerät-Standort';
-        if (marker.is_storage) return 'Lagergerät';
+        if (marker.is_multi_device) return 'MehrgerĂ€t-Standort';
+        if (marker.is_storage) return 'LagergerĂ€t';
         
         switch(marker.rental_status) {
-            case 'verfuegbar': return 'Verfügbar';
+            case 'verfuegbar': return 'VerfĂ¼gbar';
             case 'vermietet': return 'Vermietet';
             case 'wartung': return 'In Wartung';
             default: return marker.rental_status;
@@ -398,7 +423,7 @@ $showMessages = !empty($settings['show_system_messages']);
     new Chart(ctx, {
         type: 'doughnut',
         data: {
-            labels: ['Verfügbar', 'Vermietet'],
+            labels: ['VerfĂ¼gbar', 'Vermietet'],
             datasets: [{
                 data: [<?= $availableCount ?>, <?= $rentedCount ?>],
                 backgroundColor: ['#007bff', '#ffc107'],
